@@ -26,7 +26,8 @@ Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch 
   loads and runs; measured net loss on unified memory. Default off (`-mcs 0`).
 - **Build-time kernel variants** via `EXL3_HIP_DEFINES` (setup.py): `EXL3_HIP_PF_AFTER_STAGE`,
   `EXL3_MUL1_DECODE_DOT4`, `EXL3_HIP_A_RING`. All measured null (±2 %) — see below.
-- Env knobs: `EXL3_MOE_CFG`, `EXL3_HIP_PREFILL_MIN_ROWS`, `EXL3_MOE_HIP_WAIT_FINE`,
+- Env knobs: `EXL3_MOE_CFG`, `EXL3_HIP_PREFILL_MIN_ROWS`, `EXL3_HIP_SKINNY_GEMM`, `EXL3_HIP_GR_MIX_Q8`,
+  `EXL3_HIP_GR_MIX_ROWS`, `EXL3_MOE_HIP_WAIT_FINE`,
   `EXL3_INT8_GEMV_BLOCKS_PER_CU`, `EXL3_GEMV`, `EXL3_GEMV_DEBUG`, `EXL3_MOE_*_PROF`.
 
 **Harnesses (`tools/strix_halo/`):** `bench_mtp.py` (end-to-end decode), `gemv_micro.py`
@@ -44,6 +45,15 @@ Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch 
 | + int8 GEMV (`EXL3_INT8_GEMV=2`) | 31.7–31.9 (noise) |
 | + CPU offload `-mcs 16/64/128` | 29.7 / 28.2 / 27.0 (loss) |
 | + `EXL3_HIP_STG_PAD` (LDS bank conflict fix) | **34.9 mean / 41.1 peak** |
+| + skinny fp16 GEMM for GDN b/a proj (`hgemm.cu`, replaces hipblaslt split-K) | 36.1 mean / 44.4 peak |
+| + **int8 GatedResidual mixer weights** (`gr_mix_q8`, −22 % of decode bytes) | **40.0 mean / 46.3 peak** (ndt=2) · **41.3 mean / 43.7 peak** (ndt=3 dc=0.6) |
+
+Six-prompt greedy means, 512 tokens (`prompt_sweep.py`). PPL 4.225935 unchanged through every
+row. Per-round phase split (`phase_prof.py`): trunk verify forward 85–88 %, MTP head 10–12 %,
+host ≈ 1 % — decode is bytes-per-forward bound. Byte budget per trunk forward after int8
+mixers (`bytes_by_module.py`): routed experts 47 %, dense EXL3 GEMVs 40 %, mixers 13 %.
+The grouped-MoE prefill kernel streams its experts at ~55–75 GB/s against a ~135 GB/s
+practical single-kernel rate on this part and is the remaining lever.
 
 PPL 4.2259, identical across all configs. Roofline 236 GB/s.
 
