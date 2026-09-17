@@ -27,6 +27,16 @@ _EXL3_GEMV_HIP_MMODE2_VARIANTS = frozenset({
 })
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
+
+# gfx1151: hipblaslt has no good fp16-in/fp32-out kernel. For a [2048,2560]@[2560,10240] it
+# picks Cijk_..._HSS_MT64x32x8 and runs at 6.2 TFLOP/s, where the identical GEMM with an fp16
+# output runs at 34 (the card's practical peak). The gated-delta-net projections all declare
+# out_dtype=torch.float, so at prefill chunk sizes that one kernel choice was 28% of device
+# time. Compute in fp16 and widen afterwards: 4.7x faster including the cast, and the inputs
+# are fp16 anyway so the only loss is rounding the product to fp16 before the fp32 consumer.
+# Decode (few rows) keeps the direct fp32 path, where the tile choice does not matter.
+_f32_via_f16 = os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
+_f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
 _hip_gemv_support_cache: dict[int, bool] = {}
 
 
@@ -223,9 +233,16 @@ class LinearEXL3:
         rows = x.numel() // shape[-1]
         out_shape = shape[:-1] + (self.out_features,)
         x = x.view(rows, self.in_features)
-        y = torch.empty(out_shape, dtype = out_dtype or self.default_out_dtype, device = x.device)
+        dtype = out_dtype or self.default_out_dtype
+        y = torch.empty(out_shape, dtype = dtype, device = x.device)
 
-        y_ = y.view(rows, self.out_features)
+        # See _f32_via_f16 above: run the gemm into a half buffer and widen, rather than let
+        # hipblaslt pick its 6 TFLOP/s fp32-output kernel.
+        via_f16 = (_f32_via_f16 and dtype == torch.float and rows >= _f32_via_f16_min_rows)
+        if via_f16:
+            y_ = torch.empty((rows, self.out_features), dtype = torch.half, device = x.device)
+        else:
+            y_ = y.view(rows, self.out_features)
 
         # Fused path: reconstruct emits ORIGINAL-basis weights (both Hadamards + sign
         # vectors folded into the memory-bound reconstruct kernel), so the gemm runs on the
@@ -271,6 +288,9 @@ class LinearEXL3:
 
         if not use_fused:
             ext.had_r_128(y_, y_, None, self.svh, 1.0)
+
+        if via_f16:
+            y.view(rows, self.out_features).copy_(y_)
 
         if self.bias is not None:
             y += self.bias

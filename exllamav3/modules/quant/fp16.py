@@ -2,6 +2,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 from ...ext import exllamav3_ext as ext
+import os as _os
+_f32_via_f16 = _os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
+_f32_via_f16_min_rows = int(_os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
 from ...util.tensor import to2
 from ...util import first_not_none
 
@@ -92,6 +95,13 @@ class LinearFP16:
             weight.copy_(pinned, non_blocking = True)
         if dtype == x.dtype:
             torch.matmul(x, weight, out = y)
+        elif (_f32_via_f16 and dtype == torch.float and x.dtype == torch.half
+              and x.shape[0] >= _f32_via_f16_min_rows):
+            # gfx1151: hipblaslt's fp16-in/fp32-out kernels run at ~6 TFLOP/s vs ~34 for
+            # fp16-out. Compute narrow, widen after. See exl3.py for the measurement.
+            yh = torch.empty(y.shape, dtype = torch.half, device = y.device)
+            torch.matmul(x, weight, out = yh)
+            y.copy_(yh)
         else:
             ext.hgemm(x, weight, y)
         if self.bias is not None:
