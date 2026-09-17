@@ -92,8 +92,29 @@ using HipFp32x8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 // warp-private staging: [warp][cu_lane][0..3] = a01[0],a01[1],a23[0],a23[1]
 // (reused for b_hi/b_lo with slots [0..1] -> b_hi, [2..3] -> b_lo)
+// MUST cover the widest launch in the build, not just the MoE CFG in use: the
+// non-MoE GEMV paths still launch 512 threads / 16 warps and index this buffer
+// by warp id. Shrinking it to 4 produced NaN logits (out-of-bounds warp slots)
+// while eval/ppl.py still passed, so do NOT make this configurable.
 #define HIP_MMA_STG_WARPS 16   // EXL3 CFG0 max warps (512 threads); bump if CFG grows
-__shared__ __half2 hip_mma_stg[HIP_MMA_STG_WARPS][32][4];
+
+// LDS bank geometry: RDNA has 32 banks of one dword, bank = dword_address % 32.
+// __half2 is one dword, so the innermost extent IS the per-lane bank stride.
+//
+// With 4 slots the stride is 4 dwords and both access patterns collide:
+//   store stg[lane][slot]        -> banks {0,4,...,28}         4-way conflict
+//   load  stg[4*(R&7)+j][s]      -> banks {0,16}               8-way conflict
+// Padding to 5 (gcd(5,32) == 1) spreads the stores across all 32 banks and cuts
+// the loads to 2-way. Costs one dword per lane per warp.
+//
+// Build with EXL3_HIP_DEFINES="EXL3_HIP_STG_PAD" to enable.
+#if defined(EXL3_HIP_STG_PAD)
+    #define HIP_MMA_STG_SLOTS 5
+#else
+    #define HIP_MMA_STG_SLOTS 4
+#endif
+
+__shared__ __half2 hip_mma_stg[HIP_MMA_STG_WARPS][32][HIP_MMA_STG_SLOTS];
 
 __device__ __forceinline__ int hip_mma_warp_id()
 {
@@ -109,7 +130,7 @@ __device__ __forceinline__ HipFp16x8 assemble_a_frag_gfx12(const FragB& a01, con
 {
     const int lane = (int)(threadIdx.x & 31);
     const int wid  = hip_mma_warp_id();
-    __half2 (*stg)[4] = hip_mma_stg[wid];
+    __half2 (*stg)[HIP_MMA_STG_SLOTS] = hip_mma_stg[wid];
 
     stg[lane][0] = a01[0]; stg[lane][1] = a01[1];
     stg[lane][2] = a23[0]; stg[lane][3] = a23[1];
@@ -139,7 +160,7 @@ __device__ __forceinline__ HipFp16x8 assemble_b_frag_gfx12(const FragB& b_hi, co
 {
     const int lane = (int)(threadIdx.x & 31);
     const int wid  = hip_mma_warp_id();
-    __half2 (*stg)[4] = hip_mma_stg[wid];
+    __half2 (*stg)[HIP_MMA_STG_SLOTS] = hip_mma_stg[wid];
 
     stg[lane][0] = b_hi[0]; stg[lane][1] = b_hi[1];
     stg[lane][2] = b_lo[0]; stg[lane][3] = b_lo[1];
@@ -192,7 +213,7 @@ __device__ __forceinline__ HipFp16x16 assemble_a_frag_gfx115(const FragB& a01, c
 {
     const int lane = (int)(threadIdx.x & 31);
     const int wid  = hip_mma_warp_id();
-    __half2 (*stg)[4] = hip_mma_stg[wid];
+    __half2 (*stg)[HIP_MMA_STG_SLOTS] = hip_mma_stg[wid];
 
     stg[lane][0] = a01[0];   // row lane/4,     k 2t, 2t+1
     stg[lane][1] = a01[1];   // row lane/4 + 8, k 2t, 2t+1
@@ -224,7 +245,7 @@ __device__ __forceinline__ HipFp16x16 assemble_b_frag_gfx115(const FragB& b_hi, 
 {
     const int lane = (int)(threadIdx.x & 31);
     const int wid  = hip_mma_warp_id();
-    __half2 (*stg)[4] = hip_mma_stg[wid];
+    __half2 (*stg)[HIP_MMA_STG_SLOTS] = hip_mma_stg[wid];
 
     // NOTE: no leading __syncwarp() here -- mirrors assemble_b_frag_gfx12. The
     // caller has already consumed the A operand into registers, and the bits==3
