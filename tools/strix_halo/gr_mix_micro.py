@@ -32,9 +32,17 @@ for m in model.modules:
 assert site is not None
 site.load(torch.device("cuda:0"))
 H, D, LR = site.hc_mult, site.hidden_size, site.rank
-M = site.fn_h.shape[0] + 1
-fn_bytes = site.fn_h.numel() * 2
-upt_bytes = site.upx_h.numel() * 2
+M = site.proj_h.shape[0] + 1
+if getattr(site, "use_q8", False):
+    fn_bytes = site.fn_q8.numel(); upt_bytes = site.upx_q8.numel()
+    def call(s3, dots, post, mixed):
+        ext.gr_mix_q8(s3, site.fn_q8, site.fn_scale, site.upx_q8, site.up_scale, site.w_h, site.rms_eps, dots, post, mixed)
+    print("path: gr_mix_q8 (int8)")
+else:
+    fn_bytes = site.fn_h.numel() * 2; upt_bytes = site.upx_h.numel() * 2
+    def call(s3, dots, post, mixed):
+        ext.gr_mix(s3, site.fn_h, site.upx_h, site.w_h, site.rms_eps, dots, post, mixed)
+    print("path: gr_mix (fp16)")
 print(f"site={site.key} H={H} D={D} rank={LR} M={M-1}  fn={fn_bytes/2**20:.1f} MiB upt={upt_bytes/2**20:.1f} MiB")
 BW = 236e9
 print(f"one-read roofline: fn {fn_bytes/BW*1e6:.0f} us, upt {upt_bytes/BW*1e6:.0f} us, both {(fn_bytes+upt_bytes)/BW*1e6:.0f} us")
@@ -47,14 +55,14 @@ def bench(R, iters=200):
     # flush-ish: touch a big buffer so weights are not L2/MALL resident
     junk = torch.empty(64 << 20, device="cuda", dtype=torch.uint8)
     for _ in range(5):
-        ext.gr_mix(s3, site.fn_h, site.upx_h, site.w_h, site.rms_eps, dots, post, mixed)
+        call(s3, dots, post, mixed)
     torch.cuda.synchronize()
     st = torch.cuda.Event(enable_timing=True); en = torch.cuda.Event(enable_timing=True)
     tot = 0.0
     for _ in range(iters):
         junk.zero_()
         st.record()
-        ext.gr_mix(s3, site.fn_h, site.upx_h, site.w_h, site.rms_eps, dots, post, mixed)
+        call(s3, dots, post, mixed)
         en.record(); en.synchronize()
         tot += st.elapsed_time(en)
     # correctness vs reference
@@ -79,7 +87,7 @@ for R in (1, 3):
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(50):
             junk.zero_()
-            ext.gr_mix(s3, site.fn_h, site.upx_h, site.w_h, site.rms_eps, dots, post, mixed)
+            call(s3, dots, post, mixed)
         torch.cuda.synchronize()
     for e in prof.key_averages():
         if "gr_" in e.key:

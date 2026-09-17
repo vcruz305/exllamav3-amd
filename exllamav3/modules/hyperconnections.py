@@ -7,6 +7,12 @@ from .rmsnorm import RMSNorm
 from ..model.config import Config
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
+import os
+
+# gfx1151: store the GatedResidual mixer weights (the only fp16 bulk in an EXL3 model, 22% of
+# decode weight bytes) as per-row int8 and dequantize in the fused kernel. ROCm only; opt out
+# with EXL3_HIP_GR_MIX_Q8=0.
+_GR_MIX_Q8 = bool(torch.version.hip) and os.environ.get("EXL3_HIP_GR_MIX_Q8", "1") != "0"
 
 _hc_mix_support_cache: dict[tuple[object, int], bool] = {}
 
@@ -284,6 +290,8 @@ class GatedResidual(Module):
         self.inject_h = None        # (hc_mult, hc_mult * hidden) half (site form)
         self.proj_h = None          # cat(down, inject) half, unfolded (GEMM path)
         self.fn_h = None            # cat(down, inject) * w half, folded (fused path)
+        self.use_q8 = False         # int8 fused-path weights (ROCm), see _prepare
+        self.fn_q8 = self.fn_scale = self.upx_q8 = self.up_scale = None
         self.rank = 0
 
     @override
@@ -321,17 +329,34 @@ class GatedResidual(Module):
             .view(M, H * Dh)
         tmp.copy_(self.proj_h)
         tmp *= self.w_h.float()
-        self.fn_h = tmp.half().contiguous()
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
-        # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
-        self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
-            .permute(0, 1, 3, 2).contiguous()
+        self.use_q8 = _GR_MIX_Q8 and hasattr(ext, "gr_mix_q8") and dev.type == "cuda"
+        if self.use_q8:
+            # Symmetric per-row int8: fn row j (the dot product's output) and up output column
+            # h*D+d both get one scale, applied once per result inside the kernel
+            sc = tmp.abs().amax(dim = 1).clamp_min_(1e-12) / 127.0
+            self.fn_q8 = torch.round(tmp / sc[:, None]).clamp_(-127, 127).to(torch.int8).contiguous()
+            self.fn_scale = sc.contiguous()
+            up32 = self.up_h.float()
+            usc = up32.abs().amax(dim = 1).clamp_min_(1e-12) / 127.0
+            upq = torch.round(up32 / usc[:, None]).clamp_(-127, 127).to(torch.int8)
+            self.upx_q8 = upq.view(H, Dh // 4, 4, self.rank).permute(0, 1, 3, 2).contiguous()
+            self.up_scale = usc.contiguous()
+            self.fn_h = None
+            self.upx_h = None
+            del up32, upq
+        else:
+            self.fn_h = tmp.half().contiguous()
+            # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
+            self.upx_h = self.up_h.view(H, Dh // 4, 4, self.rank) \
+                .permute(0, 1, 3, 2).contiguous()
 
     @override
     def unload(self):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = self.fn_h = None
+        self.fn_q8 = self.fn_scale = self.upx_q8 = self.up_scale = None
 
     @override
     def get_tensors(self):
@@ -395,11 +420,15 @@ class GatedResidual(Module):
                 if cached:
                     return g_tensor_cache.get_bucketed(dev, numel, dtype, tag)
                 return torch.empty((numel,), dtype = dtype, device = dev)
-            M = self.fn_h.shape[0] + 1
+            M = self.proj_h.shape[0] + 1
             dots = ws(R * M * H, torch.float, "gr_mix_dots").view(R, M, H)
             post = ws(R * H, torch.float, "gr_mix_post").view(R, H) if self.use_combine else None
             mixed = ws(R * Dh, torch.half, "gr_mix_mixed").view(R, Dh)
-            ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
+            if self.use_q8:
+                ext.gr_mix_q8(s3, self.fn_q8, self.fn_scale, self.upx_q8, self.up_scale, self.w_h,
+                              self.rms_eps, dots, post, mixed)
+            else:
+                ext.gr_mix(s3, self.fn_h, self.upx_h, self.w_h, self.rms_eps, dots, post, mixed)
         else:
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None

@@ -219,7 +219,14 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     static_assert(CFG >= 0 && CFG <= 2, "unsupported GEMV configuration");
     constexpr int WK   = CFG == 0 ? 16 : CFG == 1 ? 8 : 4;  // k-split (warps per block)
     constexpr int WNT  = CFG == 0 ? 2 : 4;                    // adjacent n-tiles per warp
+#if defined(EXL3_HIP_PF_DEPTH) && (defined(USE_ROCM) || defined(__HIPCC__))
+    // gfx1151 experiment: the CFG 1/2 ring depth of 2 leaves each lane with only two B rows
+    // in flight; on a 20-CU part with ~2 us DRAM latency the grouped-MoE body (CFG 2) is
+    // latency-bound. Build with EXL3_HIP_DEFINES="EXL3_HIP_PF_DEPTH=4" to widen it.
+    constexpr int PF   = CFG == 0 ? 4 : EXL3_HIP_PF_DEPTH;
+#else
     constexpr int PF   = CFG == 0 ? 4 : 2;                    // prefetch ring depth
+#endif
     constexpr int THREADS = WK * 32;
     constexpr int COLS = WNT * 16;
 

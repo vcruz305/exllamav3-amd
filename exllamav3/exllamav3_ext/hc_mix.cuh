@@ -55,3 +55,18 @@ void gr_mix
     c10::optional<at::Tensor> post,
     at::Tensor mixed
 );
+
+// Int8 variant (per-row fn scale, per-output-column up scale); see hc_mix.cu
+void gr_mix_q8
+(
+    const at::Tensor& streams,
+    const at::Tensor& fn,
+    const at::Tensor& fn_scale,
+    const at::Tensor& upt,
+    const at::Tensor& up_scale,
+    const at::Tensor& w,
+    double rms_eps,
+    at::Tensor dots,
+    c10::optional<at::Tensor> post,
+    at::Tensor mixed
+);

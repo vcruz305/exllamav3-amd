@@ -1319,3 +1319,282 @@ void gr_mix
     #undef ARGS
     cuda_check(cudaPeekAtLastError());
 }
+
+/*
+Int8 GatedResidual mix (gfx1151 byte cut). The mixer weights are the only fp16 bulk left in an
+EXL3 model: fn (rank+H, H*D) + up (H*D, rank) = 12.5 MiB per site x 97 sites = 1.22 GiB per
+trunk forward, 22% of all weight bytes (bytes_by_module.py). Symmetric per-output-row int8
+(scale per fn row j / per up output column h*D+d) halves that; both scales factor out of the
+dot products, so they are applied once per result, and the kernels are otherwise the
+per-row gr_dots / gr_finalize that measured best on this part.
+*/
+
+__device__ __forceinline__ void unpack_s8x4(uint32_t v, float& f0, float& f1, float& f2, float& f3)
+{
+    f0 = (float) ((int) (v << 24) >> 24);
+    f1 = (float) ((int) (v << 16) >> 24);
+    f2 = (float) ((int) (v << 8) >> 24);
+    f3 = (float) ((int) v >> 24);
+}
+
+template <int H>
+__global__ __launch_bounds__(GR_THREADS_A)
+void gr_dots_q8_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const int8_t* __restrict__ fn,       // (M, H * D) int8, norm weight folded in
+    const float* __restrict__ fn_scale,  // (M)
+    float* __restrict__ dots,            // (R, M + 1, H): per-stream dots, row M = sum sq
+    const int M,
+    const int D
+)
+{
+    const int r = blockIdx.y;
+    const int j = blockIdx.x;
+    const int D4 = D / 4;
+    const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+
+    __shared__ float red[H][GR_THREADS_A / 32];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+
+    #pragma unroll
+    for (int h = 0; h < H; ++h)
+    {
+        float a = 0.0f;
+        if (j < M)
+        {
+            // 8-byte fn loads (8 int8) against two 16-byte stream quads
+            const int2* f8 = (const int2*) (fn + ((size_t) j * H + h) * D);
+            for (int c = threadIdx.x; c < D4 / 2; c += GR_THREADS_A)
+            {
+                float4 s0 = s4[(size_t) h * D4 + 2 * c];
+                float4 s1 = s4[(size_t) h * D4 + 2 * c + 1];
+                int2 pk = f8[c];
+                float w0, w1, w2, w3, w4, w5, w6, w7;
+                unpack_s8x4((uint32_t) pk.x, w0, w1, w2, w3);
+                unpack_s8x4((uint32_t) pk.y, w4, w5, w6, w7);
+                a = fmaf(s0.x, w0, a); a = fmaf(s0.y, w1, a);
+                a = fmaf(s0.z, w2, a); a = fmaf(s0.w, w3, a);
+                a = fmaf(s1.x, w4, a); a = fmaf(s1.y, w5, a);
+                a = fmaf(s1.z, w6, a); a = fmaf(s1.w, w7, a);
+            }
+        }
+        else
+        {
+            for (int c = threadIdx.x; c < D4; c += GR_THREADS_A)
+            {
+                float4 sv = s4[(size_t) h * D4 + c];
+                a = fmaf(sv.x, sv.x, fmaf(sv.y, sv.y, fmaf(sv.z, sv.z, fmaf(sv.w, sv.w, a))));
+            }
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a += __shfl_down_sync(0xffffffffu, a, offset);
+        if (lane == 0) red[h][warp] = a;
+    }
+    __syncthreads();
+    if (threadIdx.x < H)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < GR_THREADS_A / 32; ++w)
+            v += red[threadIdx.x][w];
+        if (j < M) v *= fn_scale[j];
+        dots[((size_t) r * (M + 1) + j) * H + threadIdx.x] = v;
+    }
+}
+
+template <int H, bool HALF_OUT>
+__global__ __launch_bounds__(NUM_THREADS)
+void gr_finalize_q8_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const float* __restrict__ dots,      // (R, M + 1, H)
+    const int8_t* __restrict__ upt,      // (H, D / 4, LR, 4) int8
+    const float* __restrict__ up_scale,  // (H * D) per output column
+    const half* __restrict__ w,          // (H * D) half norm weight (incl +1)
+    float* __restrict__ post,            // (R, H) or nullptr
+    void* __restrict__ mixed,            // (R, D) half or float
+    const int D,
+    const int LR,
+    const int chunk_cols,
+    const float rms_eps
+)
+{
+    const int r = blockIdx.y;
+    const int M = LR + (post ? H : 0);
+    const float* dr = dots + (size_t) r * (M + 1) * H;
+
+    __shared__ float rmr_s[H];
+    extern __shared__ float t_s[];
+    if (threadIdx.x < H)
+        rmr_s[threadIdx.x] = rsqrtf(dr[(size_t) M * H + threadIdx.x] / (float) D + rms_eps);
+    __syncthreads();
+    const float inv_h = 1.0f / (float) H;
+    for (int i = threadIdx.x; i < LR; i += NUM_THREADS)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            v = fmaf(rmr_s[h], dr[(size_t) i * H + h], v);
+        v *= inv_h;
+        t_s[i] = v * sigmoidf_(v);
+    }
+    if (post && blockIdx.x == 0 && threadIdx.x < H)
+    {
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            v = fmaf(rmr_s[h], dr[(size_t) (LR + threadIdx.x) * H + h], v);
+        post[(size_t) r * H + threadIdx.x] = 2.0f * sigmoidf_(v * inv_h);
+    }
+    __syncthreads();
+
+    const int c0 = blockIdx.x * chunk_cols;
+    const int c1 = min(c0 + chunk_cols, D);
+    const int D4 = D / 4;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+    for (int c = c0 / 4 + warp; c < c1 / 4; c += NUM_THREADS / 32)
+    {
+        float4 g[H];
+        #pragma unroll
+        for (int h = 0; h < H; ++h) g[h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int i = lane; i < LR; i += 32)
+        {
+            float ti = t_s[i];
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+            {
+                // 4 int8 = one dword per (h, column quad, rank); consecutive lanes consecutive i
+                uint32_t u = *(const uint32_t*) (upt + ((((size_t) h * D4 + c) * LR + i) * 4));
+                float u0, u1, u2, u3;
+                unpack_s8x4(u, u0, u1, u2, u3);
+                g[h].x = fmaf(ti, u0, g[h].x);
+                g[h].y = fmaf(ti, u1, g[h].y);
+                g[h].z = fmaf(ti, u2, g[h].z);
+                g[h].w = fmaf(ti, u3, g[h].w);
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            for (int offset = 16; offset > 0; offset >>= 1)
+            {
+                g[h].x += __shfl_xor_sync(0xffffffffu, g[h].x, offset);
+                g[h].y += __shfl_xor_sync(0xffffffffu, g[h].y, offset);
+                g[h].z += __shfl_xor_sync(0xffffffffu, g[h].z, offset);
+                g[h].w += __shfl_xor_sync(0xffffffffu, g[h].w, offset);
+            }
+        if (lane != 0) continue;
+        float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+        {
+            const float4 sc = *(const float4*) (up_scale + (size_t) h * D + 4 * c);
+            float4 sv = s4[(size_t) h * D4 + c];
+            half4 wq = *(const half4*) (w + (size_t) h * D + 4 * c);
+            float coef = rmr_s[h] * inv_h;
+            o.x = fmaf(sigmoidf_(g[h].x * sc.x) * coef * LOW_TO_FLOAT(wq.x),  sv.x, o.x);
+            o.y = fmaf(sigmoidf_(g[h].y * sc.y) * coef * HIGH_TO_FLOAT(wq.x), sv.y, o.y);
+            o.z = fmaf(sigmoidf_(g[h].z * sc.z) * coef * LOW_TO_FLOAT(wq.y),  sv.z, o.z);
+            o.w = fmaf(sigmoidf_(g[h].w * sc.w) * coef * HIGH_TO_FLOAT(wq.y), sv.w, o.w);
+        }
+        if (HALF_OUT)
+        {
+            half2* out2 = (half2*) ((half*) mixed + (size_t) r * D);
+            out2[c * 2] = __floats2half2_rn(o.x, o.y);
+            out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
+        }
+        else
+            ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
+    }
+}
+
+void gr_mix_q8
+(
+    const at::Tensor& streams,           // (R, H, D) float
+    const at::Tensor& fn,                // (M, H * D) int8: cat(down, inject) * w, per-row scaled
+    const at::Tensor& fn_scale,          // (M) float
+    const at::Tensor& upt,               // (H, D / 4, LR, 4) int8
+    const at::Tensor& up_scale,          // (H * D) float, per output column
+    const at::Tensor& w,                 // (H * D) half norm weight (incl +1)
+    double rms_eps,
+    at::Tensor dots,                     // (R, M + 1, H) float workspace
+    c10::optional<at::Tensor> post,      // (R, H) float out, or none
+    at::Tensor mixed                     // (R, D) half or float out
+)
+{
+    TORCH_CHECK(streams.is_cuda() && streams.dim() == 3, "gr_mix_q8: streams must be a CUDA (R, 4, D) tensor");
+    const int R = streams.size(0);
+    const int H = streams.size(1);
+    const int D = streams.size(2);
+    TORCH_CHECK(H == 4 && D > 0 && D % 8 == 0, "gr_mix_q8: streams must have shape (R, 4, D) with D divisible by 8");
+    TORCH_CHECK(upt.dim() == 4, "gr_mix_q8: upt must have shape (4, D / 4, LR, 4)");
+    const int LR = upt.size(2);
+    const int M = LR + (post ? H : 0);
+    const at::Device device = streams.device();
+    hc_check_common(streams, device, "gr_mix_q8", "streams");
+    hc_check_common(fn, device, "gr_mix_q8", "fn");
+    hc_check_common(fn_scale, device, "gr_mix_q8", "fn_scale");
+    hc_check_common(upt, device, "gr_mix_q8", "upt");
+    hc_check_common(up_scale, device, "gr_mix_q8", "up_scale");
+    hc_check_common(w, device, "gr_mix_q8", "w");
+    hc_check_common(dots, device, "gr_mix_q8", "dots");
+    hc_check_common(mixed, device, "gr_mix_q8", "mixed");
+    TORCH_CHECK(streams.scalar_type() == at::kFloat, "gr_mix_q8: streams must be float32");
+    TORCH_CHECK(fn.scalar_type() == at::kChar && upt.scalar_type() == at::kChar, "gr_mix_q8: fn/upt must be int8");
+    TORCH_CHECK(fn_scale.scalar_type() == at::kFloat && up_scale.scalar_type() == at::kFloat, "gr_mix_q8: scales must be float32");
+    TORCH_CHECK(w.scalar_type() == at::kHalf, "gr_mix_q8: w must be float16");
+    TORCH_CHECK(dots.scalar_type() == at::kFloat, "gr_mix_q8: dots must be float32");
+    TORCH_CHECK(mixed.scalar_type() == at::kFloat || mixed.scalar_type() == at::kHalf, "gr_mix_q8: mixed must be float32 or float16");
+    TORCH_CHECK(fn.dim() == 2 && fn.size(0) == M && fn.size(1) == H * D, "gr_mix_q8: fn must have shape (LR [+ 4], 4 * D)");
+    TORCH_CHECK(fn_scale.dim() == 1 && fn_scale.size(0) == M, "gr_mix_q8: fn_scale must have shape (M)");
+    TORCH_CHECK(upt.size(0) == H && upt.size(1) == D / 4 && upt.size(3) == 4, "gr_mix_q8: upt must have shape (4, D / 4, LR, 4)");
+    TORCH_CHECK(up_scale.dim() == 1 && up_scale.size(0) == H * D, "gr_mix_q8: up_scale must have shape (4 * D)");
+    TORCH_CHECK(w.dim() == 1 && w.size(0) == H * D, "gr_mix_q8: w must have shape (4 * D)");
+    TORCH_CHECK(dots.dim() == 3 && dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix_q8: dots must have shape (R, M + 1, 4)");
+    TORCH_CHECK(mixed.dim() == 2 && mixed.size(0) == R && mixed.size(1) == D, "gr_mix_q8: mixed must have shape (R, D)");
+    if (post)
+    {
+        hc_check_common(post.value(), device, "gr_mix_q8", "post");
+        TORCH_CHECK(post.value().scalar_type() == at::kFloat && post.value().dim() == 2 &&
+                    post.value().size(0) == R && post.value().size(1) == H, "gr_mix_q8: post must be float32 (R, 4)");
+    }
+    hc_check_aligned(streams, "gr_mix_q8", "streams");
+    hc_check_aligned(fn, "gr_mix_q8", "fn");
+    hc_check_aligned(upt, "gr_mix_q8", "upt");
+    hc_check_aligned(up_scale, "gr_mix_q8", "up_scale");
+    hc_check_aligned(w, "gr_mix_q8", "w");
+    hc_check_aligned(mixed, "gr_mix_q8", "mixed");
+    TORCH_CHECK(hc_mix_supported(device.index()), "gr_mix_q8: device must use a 32-lane warp/wavefront");
+    if (R == 0) return;
+
+    const at::cuda::OptionalCUDAGuard device_guard(device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    dim3 grid_a(M + 1, R);
+    gr_dots_q8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
+    (
+        (const float*) streams.data_ptr(), (const int8_t*) fn.data_ptr(), (const float*) fn_scale.data_ptr(),
+        (float*) dots.data_ptr(), M, D
+    );
+    cuda_check(cudaPeekAtLastError());
+
+    const int gran = 4 * (NUM_THREADS / 32);
+    int chunks_c = std::max(1, std::min((D + gran - 1) / gran, 512 / R));
+    int chunk_cols = ((D / chunks_c + gran - 1) / gran) * gran;
+    int n_chunks = (D + chunk_cols - 1) / chunk_cols;
+    dim3 grid_c(n_chunks, R);
+    int smem = LR * sizeof(float);
+    float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
+    #define ARGS_Q8 \
+        (const float*) streams.data_ptr(), (const float*) dots.data_ptr(), \
+        (const int8_t*) upt.data_ptr(), (const float*) up_scale.data_ptr(), (const half*) w.data_ptr(), \
+        post_p, mixed.data_ptr(), D, LR, chunk_cols, (float) rms_eps
+    if (mixed.dtype() == at::kHalf)
+        gr_finalize_q8_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS_Q8);
+    else
+        gr_finalize_q8_kernel<4, false><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS_Q8);
+    #undef ARGS_Q8
+    cuda_check(cudaPeekAtLastError());
+}
