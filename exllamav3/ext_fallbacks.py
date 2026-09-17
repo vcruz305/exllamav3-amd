@@ -713,7 +713,7 @@ def dsa_topk_gfx12_supported(
     device = torch.cuda.current_device() if scores.device.index is None else scores.device.index
     props = torch.cuda.get_device_properties(device)
     arch = getattr(props, "gcnArchName", "").split(":", 1)[0]
-    return arch in ("gfx1200", "gfx1201") and getattr(props, "warp_size", 0) == 32
+    return arch in ("gfx1200", "gfx1201", "gfx1150", "gfx1151", "gfx1152") and getattr(props, "warp_size", 0) == 32
 
 
 def dsa_topk(

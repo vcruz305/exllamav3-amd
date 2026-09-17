@@ -110,6 +110,43 @@ __global__ void moe_flag_wait_kernel_hip
     moe_wait_geq_hip(flag, value, abort_flag, max_polls);
 }
 
+// Fine-grained variant (EXL3_MOE_HIP_WAIT_FINE=1): one short s_sleep per poll instead of a
+// ~32K-cycle backoff epoch. The epoch was sized for multi-second GPU-side waits on gfx1201;
+// in the per-layer expert split the worker answers in ~0.2 ms, so a coarse epoch adds up to a
+// full epoch of latency to every layer of every decode step. Budget is calibrated separately.
+__device__ __forceinline__ bool moe_wait_geq_fine_hip
+(
+    const uint32_t* flag,
+    uint32_t value,
+    uint32_t* abort_flag,
+    unsigned long long max_polls
+)
+{
+    unsigned long long polls = 0;
+    while (true)
+    {
+        uint32_t v = moe_acquire_sys_u32(flag);
+        if ((int32_t)(v - value) >= 0) return true;
+        __builtin_amdgcn_s_sleep(2);
+        if (++polls >= max_polls)
+        {
+            moe_release_sys_u32(abort_flag, 1u);
+            return false;
+        }
+    }
+}
+
+__global__ void moe_flag_wait_fine_kernel_hip
+(
+    uint32_t* flag,
+    uint32_t value,
+    uint32_t* abort_flag,
+    unsigned long long max_polls
+)
+{
+    moe_wait_geq_fine_hip(flag, value, abort_flag, max_polls);
+}
+
 // -------------------------------------------------------------------------------------------
 //   Poll-budget calibration: s_sleep is cycle-based, so convert the wait timeout (ns) to a
 //   poll budget by measuring the kernel once. Runs on the first flag_wait enqueue; costs one
@@ -118,13 +155,31 @@ __global__ void moe_flag_wait_kernel_hip
 
 static std::atomic<bool> g_polls_ready { false };
 static std::atomic<unsigned long long> g_max_polls { 0 };
+static std::atomic<bool> g_polls_ready_fine { false };
+static std::atomic<unsigned long long> g_max_polls_fine { 0 };
 static constexpr unsigned long long MOE_WAIT_TIMEOUT_NS = 30000000000ull;
+
+static bool moe_wait_fine_enabled()
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("EXL3_MOE_HIP_WAIT_FINE"); v = (e && *e && *e != '0') ? 1 : 0; }
+    return v == 1;
+}
+
+static unsigned long long moe_wait_poll_budget_impl(hipStream_t stream, bool fine);
 
 static unsigned long long moe_wait_poll_budget(hipStream_t stream)
 {
-    unsigned long long polls = g_max_polls.load(std::memory_order_relaxed);
+    return moe_wait_poll_budget_impl(stream, moe_wait_fine_enabled());
+}
+
+static unsigned long long moe_wait_poll_budget_impl(hipStream_t stream, bool fine)
+{
+    std::atomic<unsigned long long>& g_max = fine ? g_max_polls_fine : g_max_polls;
+    std::atomic<bool>& g_ready = fine ? g_polls_ready_fine : g_polls_ready;
+    unsigned long long polls = g_max.load(std::memory_order_relaxed);
     if (polls) return polls;
-    if (g_polls_ready.exchange(true, std::memory_order_acq_rel))
+    if (g_ready.exchange(true, std::memory_order_acq_rel))
     {
         // Another thread is calibrating (or failed); fall back to a conservative estimate:
         // ~3 us per poll epoch at gfx1201 sclk (~9.5 us worst case; the
@@ -135,15 +190,19 @@ static unsigned long long moe_wait_poll_budget(hipStream_t stream)
     if (hipMalloc(&scratch, 8) != hipSuccess)
     {
         (void) hipGetLastError();
-        g_polls_ready.store(false, std::memory_order_relaxed);
+        g_ready.store(false, std::memory_order_relaxed);
         return 64 + MOE_WAIT_TIMEOUT_NS / 10000ull;
     }
     (void) hipMemset(scratch, 0, 8);
     uint32_t* abort_scratch = scratch + 1;
     // Measure a known poll budget with no publisher; timeout scales linearly in polls.
-    const unsigned long long probe_polls = 20000ull;
-    moe_flag_wait_kernel_hip<<<1, 1, 0, stream>>>(scratch, 0x7FFFFFFFu, abort_scratch,
-                                                 probe_polls);
+    const unsigned long long probe_polls = fine ? 2000000ull : 20000ull;
+    if (fine)
+        moe_flag_wait_fine_kernel_hip<<<1, 1, 0, stream>>>(scratch, 0x7FFFFFFFu, abort_scratch,
+                                                          probe_polls);
+    else
+        moe_flag_wait_kernel_hip<<<1, 1, 0, stream>>>(scratch, 0x7FFFFFFFu, abort_scratch,
+                                                     probe_polls);
     auto t0 = std::chrono::steady_clock::now();
     hipError_t e = hipStreamSynchronize(stream);
     double ns_per_poll = 10000.0;   // fallback estimate
@@ -160,7 +219,8 @@ static unsigned long long moe_wait_poll_budget(hipStream_t stream)
     }
     hipFree(scratch);
     unsigned long long budget = 64 + (unsigned long long)(MOE_WAIT_TIMEOUT_NS / ns_per_poll);
-    g_max_polls.store(budget, std::memory_order_relaxed);
+    g_max.store(budget, std::memory_order_relaxed);
+    if (getenv("EXL3_MOE_HANDOFF_PROF")) printf(" -- hip wait calib: fine=%d ns/poll=%.1f budget=%llu\n", (int) fine, ns_per_poll, budget);
     return budget;
 }
 
@@ -182,13 +242,22 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
 {
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     unsigned long long budget = moe_wait_poll_budget(stream);
-    moe_flag_wait_kernel_hip<<<1, 1, 0, stream>>>
-    (
-        reinterpret_cast<uint32_t*>(flag),
-        static_cast<uint32_t>(value),
-        reinterpret_cast<uint32_t*>(abort_flag),
-        budget
-    );
+    if (moe_wait_fine_enabled())
+        moe_flag_wait_fine_kernel_hip<<<1, 1, 0, stream>>>
+        (
+            reinterpret_cast<uint32_t*>(flag),
+            static_cast<uint32_t>(value),
+            reinterpret_cast<uint32_t*>(abort_flag),
+            budget
+        );
+    else
+        moe_flag_wait_kernel_hip<<<1, 1, 0, stream>>>
+        (
+            reinterpret_cast<uint32_t*>(flag),
+            static_cast<uint32_t>(value),
+            reinterpret_cast<uint32_t*>(abort_flag),
+            budget
+        );
 }
 
 // No-op on ROCm: native stream memory operations are not used (see file header). The Python

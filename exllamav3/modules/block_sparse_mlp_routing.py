@@ -90,13 +90,23 @@ def _hip_grouped_max_rows() -> int:
 
 _HIP_GROUPED_MAX_ROWS = _hip_grouped_max_rows()
 # The native prefill binding follows the grouped cap boundary and accepts rows 2..512.
-_HIP_PREFILL_MIN_ROWS = _HIP_GROUPED_MAX_ROWS + 1
+# Crossover between the per-(row,expert) decode kernel and the expert-GROUPED
+# prefill kernel. The prefill kernel sorts assignments by expert and amortizes
+# each expert's weight read over up to 16 rows, which is exactly what a
+# multi-row MTP verification batch wants: at 3 rows, 31% of the decode path's
+# expert reads are duplicates. Lowering this routes small speculative batches
+# through the deduplicating kernel. Default 17 keeps the original split.
+_HIP_PREFILL_MIN_ROWS = max(
+    2, int(os.environ.get("EXL3_HIP_PREFILL_MIN_ROWS", _HIP_GROUPED_MAX_ROWS + 1)))
 _HIP_PREFILL_MAX_ROWS = 2048
 _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
 
 
 def _hip_grouped_rows_eligible(rows: int) -> bool:
-    return 1 <= rows <= _HIP_GROUPED_MAX_ROWS
+    # Yield to the expert-grouped prefill kernel once it claims this row count,
+    # otherwise the per-(row,expert) decode kernel would take it first and
+    # re-read duplicate expert weights.
+    return 1 <= rows <= min(_HIP_GROUPED_MAX_ROWS, _HIP_PREFILL_MIN_ROWS - 1)
 
 
 def _hip_prefill_rows_eligible(rows: int) -> bool:
@@ -112,7 +122,9 @@ def _hip_router_device_supported(device):
     index = torch.cuda.current_device() if device.index is None else device.index
     props = torch.cuda.get_device_properties(index)
     arch = getattr(props, "gcnArchName", "").split(":", 1)[0]
-    return arch in ("gfx1200", "gfx1201") and getattr(props, "warp_size", 0) == 32
+    # routing_std_gfx12 uses only wave-width primitives (__shfl_down/__syncwarp),
+    # no RDNA4-only instruction, so any wave32 gfx11.5/gfx12 part qualifies.
+    return arch in ("gfx1200", "gfx1201", "gfx1150", "gfx1151", "gfx1152") and getattr(props, "warp_size", 0) == 32
 
 
 def _hip_router_config_supported(cfg):

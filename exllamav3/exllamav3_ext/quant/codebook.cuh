@@ -46,7 +46,11 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
 // V_DOT4; the dp4a byte-sum is emulated with ~5 VALU ops per state, the SAD form is one
 // instruction and the decode chain is instruction-issue-bound). Same contract as
 // decode_mul1_product_2; see the 2026-09-10 campaign (exl3-decode attribution, §13).
-#if defined(__gfx1200__) || defined(__gfx1201__)
+// gfx11.5 (gfx1150/1151/1152) shares the V_SAD_U8 encoding and additionally has V_DOT4_U32_U8;
+// both are one VALU op against six for the polyfilled dp4a byte sum. Enabled on gfx11.5 too.
+// EXL3_MUL1_DECODE_DOT4 (build-time) selects the dot4 form there.
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+#define EXL3_CB_HAVE_SAD 1
 __device__ inline uint32_t exl3_sad_u8_(uint32_t p, uint32_t addend)
 {
     uint32_t u;
@@ -56,8 +60,13 @@ __device__ inline uint32_t exl3_sad_u8_(uint32_t p, uint32_t addend)
 
 __device__ inline half2 decode_mul1_product_2_sad(uint32_t x0, uint32_t x1)
 {
+#if (defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)) && defined(EXL3_MUL1_DECODE_DOT4)
+    const uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
+    const uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
+#else
     const uint32_t sum1 = exl3_sad_u8_(x1, 0x6400u);
     const uint32_t sum0 = exl3_sad_u8_(x0, 0x6400u);
+#endif
     const uint32_t packed = (sum1 << 16) + sum0;   // u + 1024 <= 2029: no 16-bit carry
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
@@ -151,7 +160,7 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
     {
         x0 *= 0x83DCD12Du;
         x1 *= 0x83DCD12Du;
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(EXL3_CB_HAVE_SAD)
         return decode_mul1_product_2_sad(x0, x1);
 #else
         return decode_mul1_product_2(x0, x1);

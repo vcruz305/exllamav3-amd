@@ -44,10 +44,26 @@ using FragC   = HipVec<float, 4>;   // CDNA MFMA accumulator: 4 fp32 per lane  (
 using FragC8  = HipVec<float, 8>;   // gfx12 WMMA accumulator: 8 fp32 per lane (fp32 accumulate)
 using FragC_h = HipVec<half2, 2>;   // legacy fp16-accumulate shape, kept for shape parity only
 
+// Arch family macros. gfx12 (RDNA4) and gfx11.5 (RDNA3.5) both have a wave32
+// v_wmma_f32_16x16x16_f16, but with DIFFERENT builtins and DIFFERENT fragment
+// layouts -- they are not interchangeable. See the layout comments below.
+#if defined(EXL3_HIP_WMMA_GFX12)
+    #define EXL3_HIP_WMMA_GFX12 1
+#endif
+#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+    #define EXL3_HIP_WMMA_GFX115 1
+#endif
+
 // WMMA operand registers on gfx12: 8 fp16 per lane (A and B) -> one 128-bit vector reg.
 // Use the HIP vector types so the compiler sees the required v8f16 register form.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(EXL3_HIP_WMMA_GFX12)
 using HipFp16x8 = __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16;
+#endif
+// gfx11.5 takes 16 fp16 per lane (the full k range) -> one 256-bit vector reg.
+#if defined(EXL3_HIP_WMMA_GFX115)
+using HipFp16x16 = __attribute__((__vector_size__(16 * sizeof(__fp16)))) __fp16;
+#endif
+#if defined(EXL3_HIP_WMMA_GFX12) || defined(EXL3_HIP_WMMA_GFX115)
 using HipFp32x8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 #endif
 
@@ -88,7 +104,7 @@ __device__ __forceinline__ int hip_mma_warp_id()
 // (CUDA m16n8k16 A-fragment semantics, PTX ISA 9.7.15.5.8):
 //   lane l: g=l>>2, t=l&3  a01[0] = A[g][2t],A[g][2t+1]   a23[0] = A[g][2t+8],A[g][2t+9]
 //   a01[1]/a23[1] carry rows g+8 for the throughput MoE m <= 16 path.
-#if defined(__gfx1200__) || defined(__gfx1201__)   // ---- gfx12 only: assembly helpers ----
+#if defined(EXL3_HIP_WMMA_GFX12)   // ---- gfx12 only: assembly helpers ----
 __device__ __forceinline__ HipFp16x8 assemble_a_frag_gfx12(const FragB& a01, const FragB& a23)
 {
     const int lane = (int)(threadIdx.x & 31);
@@ -147,9 +163,119 @@ __device__ __forceinline__ HipFp16x8 assemble_b_frag_gfx12(const FragB& b_hi, co
 // (documented here so the kernel's reduction stage can consume FragC8 directly.)
 #endif  // __gfx1200__ || __gfx1201__
 
+// =====================================================================================
+// gfx11.5 (RDNA3.5, Strix Halo):  v_wmma_f32_16x16x16_f16   (wave32)
+// =====================================================================================
+// D[16x16 f32] = A[16x16 f16] * B[16x16 f16] + C[16x16 f32], one instruction per tile.
+//
+// FRAGMENT LAYOUT (ORACLE-VERIFIED on gfx1151, ROCm 7.13; candidate layouts scored
+// against an fp32 CPU reference, exact match at maxerr = 0.0):
+//     A: lane l, reg r 0..15  ->  A[row = l & 15][k = r]        (lane = one row, all 16 k)
+//     B: lane l, reg r 0..15  ->  B[k = r][col = l & 15]        (lane = one column)
+//     C: lane l, reg r 0..7   ->  C[row = 2*r + (l >> 4)][col = l & 15]
+//
+// THREE differences from gfx12 (RDNA4) -- this is why the gfx12 path cannot simply have
+// its arch check widened:
+//   1. the builtin is ..._f16_w32, NOT ..._f16_w32_gfx12 (the latter does not exist here)
+//   2. A and B carry 16 halves per lane (the full k range), not 8 with k split across
+//      the two half-warps
+//   3. C rows INTERLEAVE as 2*reg + half, they do not block as (half)*8 + reg
+//
+// Like gfx12, operands are assembled through the warp-private LDS staging buffer rather
+// than __shfl_sync (see the gfx12 note above on the shuffle -> WMMA hazard).
+#if defined(EXL3_HIP_WMMA_GFX115)
+
+// Build the gfx11.5 A operand (16 halves = full k) from the CUDA m16n8k16 A fragment.
+// CUDA semantics: lane l holds row l/4 (a01/a23 elem 0) and row l/4+8 (elem 1),
+// k = 2*(l&3){,+1} for a01 and +8{,+9} for a23.
+__device__ __forceinline__ HipFp16x16 assemble_a_frag_gfx115(const FragB& a01, const FragB& a23)
+{
+    const int lane = (int)(threadIdx.x & 31);
+    const int wid  = hip_mma_warp_id();
+    __half2 (*stg)[4] = hip_mma_stg[wid];
+
+    stg[lane][0] = a01[0];   // row lane/4,     k 2t, 2t+1
+    stg[lane][1] = a01[1];   // row lane/4 + 8, k 2t, 2t+1
+    stg[lane][2] = a23[0];   // row lane/4,     k 2t+8, 2t+9
+    stg[lane][3] = a23[1];   // row lane/4 + 8, k 2t+8, 2t+9
+    __syncwarp();
+
+    const int R    = lane & 15;         // AMD A row this lane owns
+    const int base = 4 * (R & 7);       // the four CUDA lanes holding that row
+    const int s_lo = (R < 8) ? 0 : 1;   // slot for k 0..7
+    const int s_hi = (R < 8) ? 2 : 3;   // slot for k 8..15
+
+    HipFp16x16 a;
+    uint32_t* aw = reinterpret_cast<uint32_t*>(&a);   // 16 halves = 8 dwords
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const __half2 lo = stg[base + j][s_lo];       // k 2j, 2j+1
+        const __half2 hi = stg[base + j][s_hi];       // k 8+2j, 9+2j
+        aw[j]     = *reinterpret_cast<const uint32_t*>(&lo);
+        aw[4 + j] = *reinterpret_cast<const uint32_t*>(&hi);
+    }
+    return a;
+}
+
+// Build the gfx11.5 B operand (16 halves = full k) from the decoded tile halves.
+// CUDA semantics: lane l holds col g = l>>2 (b_hi) and g+8 (b_lo), same k pattern.
+__device__ __forceinline__ HipFp16x16 assemble_b_frag_gfx115(const FragB& b_hi, const FragB& b_lo)
+{
+    const int lane = (int)(threadIdx.x & 31);
+    const int wid  = hip_mma_warp_id();
+    __half2 (*stg)[4] = hip_mma_stg[wid];
+
+    // NOTE: no leading __syncwarp() here -- mirrors assemble_b_frag_gfx12. The
+    // caller has already consumed the A operand into registers, and the bits==3
+    // path stages under divergence (lane < 24), so an extra barrier in divergent
+    // code can deadlock the wave.
+    stg[lane][0] = b_hi[0];  // col g,     k 2t, 2t+1
+    stg[lane][1] = b_hi[1];  // col g,     k 2t+8, 2t+9
+    stg[lane][2] = b_lo[0];  // col g + 8, k 2t, 2t+1
+    stg[lane][3] = b_lo[1];  // col g + 8, k 2t+8, 2t+9
+    __syncwarp();
+
+    const int C    = lane & 15;         // AMD B column this lane owns
+    const int base = 4 * (C & 7);
+    const int s_lo = (C < 8) ? 0 : 2;   // slot for k 0..7
+    const int s_hi = (C < 8) ? 1 : 3;   // slot for k 8..15
+
+    HipFp16x16 b;
+    uint32_t* bw = reinterpret_cast<uint32_t*>(&b);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+    {
+        const __half2 lo = stg[base + j][s_lo];
+        const __half2 hi = stg[base + j][s_hi];
+        bw[j]     = *reinterpret_cast<const uint32_t*>(&lo);
+        bw[4 + j] = *reinterpret_cast<const uint32_t*>(&hi);
+    }
+    return b;
+}
+
+template <typename FragC_t>
+__device__ __forceinline__ void mma_ab_h_hip_gfx115_preassembled_a(
+    const HipFp16x16& a,
+    const FragB& b_hi,
+    const FragB& b_lo,
+    FragC_t& c)
+{
+    static_assert(sizeof(FragC_t) == sizeof(HipFp32x8),
+                  "gfx11.5 path accumulates in 8 fp32 per lane (FragC8)");
+    HipFp16x16 b = assemble_b_frag_gfx115(b_hi, b_lo);
+    HipFp32x8 d = *reinterpret_cast<HipFp32x8*>(&c);
+    d = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, d);
+    *reinterpret_cast<HipFp32x8*>(&c) = d;
+}
+
+// C fragment <-> tile map for the kernel epilogue:
+//   C(lane, reg) = C[row = 2*reg + (lane >> 4)][col = lane & 15]
+#endif  // EXL3_HIP_WMMA_GFX115
+
 // mma m16n8k16 x2 (n=16)  ->  one v_wmma_f32_16x16x16_f16
 // A from a01/a23, B from b_hi(=f0, cols 0..7) + b_lo(=f1, cols 8..15), fp32 accumulate.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(EXL3_HIP_WMMA_GFX12)
 template <typename FragC_t>
 __device__ __forceinline__ void mma_ab_h_hip_gfx12_preassembled_a(
     const HipFp16x8& a,
@@ -174,9 +300,12 @@ __device__ __forceinline__ void mma_ab_h_hip(
     const FragB& b_lo,
     FragC_t& c)
 {
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(EXL3_HIP_WMMA_GFX12)
     HipFp16x8 a = assemble_a_frag_gfx12(a01, a23);
     mma_ab_h_hip_gfx12_preassembled_a(a, b_hi, b_lo, c);
+#elif defined(EXL3_HIP_WMMA_GFX115)
+    HipFp16x16 a = assemble_a_frag_gfx115(a01, a23);
+    mma_ab_h_hip_gfx115_preassembled_a(a, b_hi, b_lo, c);
 #elif defined(__gfx90a__) || defined(__gfx94__) || defined(__gfx950__)
     // CDNA MFMA layout is not oracle-verified. This inert body exists only so a fat ROCm
     // build can compile; exl3_gemv_try_launch rejects CDNA at runtime.

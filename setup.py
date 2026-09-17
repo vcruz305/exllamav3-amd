@@ -54,6 +54,10 @@ if cuda_host_cxx := os.environ.get("CUDAHOSTCXX"):
 
 if torch and torch_version.hip:
     extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
+    # Kernel A/B switches for the gfx11.5 GEMV work (see quant/exl3_gemv_kernel.cuh, codebook.cuh).
+    # EXL3_HIP_DEFINES="EXL3_HIP_PF_AFTER_STAGE EXL3_MUL1_DECODE_DOT4" at build time.
+    for d in os.environ.get("EXL3_HIP_DEFINES", "").split():
+        extra_cuda_cflags += ["-D" + d]
     # ROCm 7.14 ships clang 22, which treats the deprecated `register` keyword as
     # a hard error in C++17 mode (older ROCm toolchains only warned).
     extra_cflags += ["-Wno-register"]

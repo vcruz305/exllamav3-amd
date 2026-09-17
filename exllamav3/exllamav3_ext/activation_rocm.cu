@@ -4,6 +4,10 @@
 #include <hip/hip_runtime.h>
 #include <ATen/hip/HIPContext.h>
 #include <c10/hip/HIPGuard.h>
+// c10/hip/HIPGuard.h does NOT define the MasqueradingAsCUDA guards that
+// hipify rewrites c10::cuda::OptionalCUDAGuard into; pull in the ATen header
+// that actually declares them (this file is ROCm-only, see build_config.py).
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cstdint>
 
 #include "activation.cuh"

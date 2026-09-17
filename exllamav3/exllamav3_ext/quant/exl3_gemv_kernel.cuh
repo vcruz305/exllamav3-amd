@@ -83,13 +83,20 @@ __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
 // instruction's accumulator operand). gfx1201 lacks V_DOT4, but V_SAD_U8 is present
 // (MC encoding 0xd6 0x22 on gfx1201). This replaces ~5 VALU ops per state with ~3
 // (mul + sad + pair-pack) — the decode chain was instruction-issue-bound.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+// gfx11.5 (gfx1150/1151/1152, Strix Point / Strix Halo) also has V_SAD_U8, and additionally the
+// native V_DOT4_U32_U8 that gfx12 lacks. Either is one VALU op versus six for the compat_rocm.cuh
+// dp4a polyfill (and, bfe, lshr, bfe, add3, add3) that the generic branch below expands to.
+// EXL3_MUL1_DECODE_DOT4=1 at build time selects the dot4 form on gfx11.5 for A/B.
+#if defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+#define EXL3_HAVE_SAD_DECODE 1
+#if !defined(EXL3_CB_HAVE_SAD)
 __device__ __forceinline__ uint32_t exl3_sad_u8_(uint32_t p, uint32_t addend)
 {
     uint32_t u;
     asm("v_sad_u8 %0, %1, %2, %3" : "=v"(u) : "v"(p), "n"(0), "n"(addend));
     return u;
 }
+#endif
 
 __device__ __forceinline__ half2 decode_pair_cb2_sad_(uint32_t x0, uint32_t x1)
 {
@@ -97,8 +104,13 @@ __device__ __forceinline__ half2 decode_pair_cb2_sad_(uint32_t x0, uint32_t x1)
     x1 *= 0x83DCD12Du;
     // sum_i = u_i + 1024 (<= 2029, no 16-bit carry): pack the two states' values
     // into one dword, then the same hfma2 as the dp4a form.
+#if (defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)) && defined(EXL3_MUL1_DECODE_DOT4)
+    const uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
+    const uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
+#else
     const uint32_t sum1 = exl3_sad_u8_(x1, 0x6400u);
     const uint32_t sum0 = exl3_sad_u8_(x0, 0x6400u);
+#endif
     const uint32_t packed = (sum1 << 16) + sum0;
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
@@ -114,7 +126,7 @@ __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, u
 {
     if constexpr (cb == 2)
     {
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(EXL3_HAVE_SAD_DECODE)
         f0[0] = decode_pair_cb2_sad_(w0, w1);
         f0[1] = decode_pair_cb2_sad_(w2, w3);
         f1[0] = decode_pair_cb2_sad_(w4, w5);
@@ -347,6 +359,25 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 for (int l = 0; l < LOADS; ++l)
                     pf[d][l] = ld_b(d, l);
 
+#if defined(EXL3_HIP_A_RING)
+        // A fragment prefetch ring, same depth as B. Without it every k-slice issues its A loads
+        // and immediately consumes them, and the compiler's s_waitcnt vmcnt(0) for that consume
+        // exposes a full global-memory round trip per slice (measured: waves stalled ~half their
+        // lifetime, 36% VALU issue, 144 of 236 GB/s on gfx1151 at m=3). A is tiny; latency is not.
+        auto ld_a = [&] (int i, FragB& a01, FragB& a23)
+        {
+            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
+            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
+            a01[1] = r1_ok ? A2[a_row1 + a_col] : hzero;
+            a23[1] = r1_ok ? A2[a_row1 + a_col + 4] : hzero;
+        };
+        FragB pa01[PF], pa23[PF];
+        #pragma unroll
+        for (int d = 0; d < PF; ++d)
+            if (d < myn) ld_a(d, pa01[d], pa23[d]);
+#endif
+
 #if defined(USE_ROCM) || defined(__HIPCC__)
         // fp32 accumulator: gfx12 WMMA accumulates in fp32 natively, one 16x16 tile per
         // call, no cadence fold needed
@@ -369,12 +400,22 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             for (int l = 0; l < LOADS; ++l)
                 bw[l] = pf[d][l];
 
+#if defined(EXL3_HIP_A_RING)
+            // A fragment for this slice from the prefetch ring (loaded PF slices ago)
+            FragB a01 = pa01[d], a23 = pa23[d];
+#endif
+
+#if !defined(EXL3_HIP_PF_AFTER_STAGE)
             if (i + PF < myn)
             {
                 #pragma unroll
                 for (int l = 0; l < LOADS; ++l)
                     pf[d][l] = ld_b(i + PF, l);
+#if defined(EXL3_HIP_A_RING)
+                ld_a(i + PF, pa01[d], pa23[d]);
+#endif
             }
+#endif
 
 #if defined(USE_ROCM) || defined(__HIPCC__)
             // Staged extraction: write valid tile words to warp-private smem, then decode.
@@ -388,6 +429,20 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     sh_stage[warp][stage_word] = bw[l];
             }
             __syncwarp();
+#if defined(EXL3_HIP_PF_AFTER_STAGE)
+            // Next B row into the ring only now: nothing below this point needs it this
+            // iteration, so the wait the compiler emits for the stage store above cannot
+            // include it, and the load overlaps the extraction + WMMA of this slice.
+            if (i + PF < myn)
+            {
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = ld_b(i + PF, l);
+#if defined(EXL3_HIP_A_RING)
+                ld_a(i + PF, pa01[d], pa23[d]);
+#endif
+            }
+#endif
 #else
             if constexpr (SMEM_STAGE)
             {
@@ -400,6 +455,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             }
 #endif
 
+#if !defined(EXL3_HIP_A_RING)
             // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
             const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
             FragB a01, a23;
@@ -407,11 +463,14 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
             a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
             a01[1] = r1_ok ? A2[a_row1 + a_col] : hzero;
             a23[1] = r1_ok ? A2[a_row1 + a_col + 4] : hzero;
+#endif
 
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(EXL3_HIP_WMMA_GFX12)
             // Every adjacent N tile uses the same A rows for this K slice. Assemble the full
             // operand before the B tiles reuse the warp-private staging buffer.
             HipFp16x8 a_frag = assemble_a_frag_gfx12(a01, a23);
+#elif defined(EXL3_HIP_WMMA_GFX115)
+            HipFp16x16 a_frag = assemble_a_frag_gfx115(a01, a23);
 #endif
 
             #pragma unroll
@@ -432,8 +491,10 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 // One WMMA covers the full 16x16 tile: f0 = cols 0..7 (b_hi), f1 = cols 8..15
                 // (b_lo); operands are reassembled through the LDS staging inside hip_mma.cuh,
                 // never via lane shuffles
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(EXL3_HIP_WMMA_GFX12)
                 mma_ab_h_hip_gfx12_preassembled_a(a_frag, f0, f1, acc[t]);
+#elif defined(EXL3_HIP_WMMA_GFX115)
+                mma_ab_h_hip_gfx115_preassembled_a(a_frag, f0, f1, acc[t]);
 #else
                 mma_ab_h_hip(a01, a23, f0, f1, acc[t]);
 #endif
@@ -498,6 +559,19 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         {
             // MMODE 2 reuses eight shared rows for the two C-fragment half-warps, avoiding
             // the 16-row reduction buffer that limits gfx12 occupancy to one block per WGP.
+#if defined(EXL3_HIP_WMMA_GFX115)
+            // gfx11.5 C rows interleave (row = 2*reg + half), so the low eight rows
+            // live in regs 0..3 of BOTH half-warps rather than in lanes 0..15.
+            {
+                const int h = lane >> 4;
+                const int c = lane & 15;
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int r = 0; r < 4; ++r)
+                        sh_red[warp][2 * r + h][t * 16 + c] = acc[t][r];
+            }
+#else
             if (lane < 16)
             {
                 #pragma unroll
@@ -506,6 +580,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     for (int r = 0; r < 8; ++r)
                         sh_red[warp][r][t * 16 + lane] = acc[t][r];
             }
+#endif
             __syncthreads();
 
             const int rows_out = min(size_m, 8);
@@ -525,6 +600,18 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 
             if (size_m > 8)
             {
+#if defined(EXL3_HIP_WMMA_GFX115)
+                // upper eight rows: regs 4..7, both half-warps (row = 2*(r-4) + half + 8)
+                {
+                    const int h = lane >> 4;
+                    const int c = lane & 15;
+                    #pragma unroll
+                    for (int t = 0; t < WNT; ++t)
+                        #pragma unroll
+                        for (int r = 4; r < 8; ++r)
+                            sh_red[warp][2 * (r - 4) + h][t * 16 + c] = acc[t][r];
+                }
+#else
                 if (lane >= 16)
                 {
                     #pragma unroll
@@ -533,6 +620,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                         for (int r = 0; r < 8; ++r)
                             sh_red[warp][r][t * 16 + (lane & 15)] = acc[t][r];
                 }
+#endif
                 __syncthreads();
 
                 const int upper_rows_out = min(size_m - 8, 8);
@@ -555,6 +643,23 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         {
             // m <= 8 keeps all valid rows in the first half-warp: lanes 0..15 each hold one
             // column of the tile across all 8 row registers.
+#if defined(EXL3_HIP_WMMA_GFX115)
+            // gfx11.5: row = 2*reg + (lane>>4). For m <= 8 the rows are spread over
+            // regs 0..3 of both half-warps, not regs 0..7 of the first one.
+            {
+                const int h = lane >> 4;
+                const int c = lane & 15;
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int r = 0; r < 4; ++r)
+                    {
+                        const int row = 2 * r + h;
+                        if (row < min(ROWS, 8))
+                            sh_red[warp][row][t * 16 + c] = acc[t][r];
+                    }
+            }
+#else
             if (lane < 16)
             {
                 #pragma unroll
@@ -563,6 +668,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                     for (int r = 0; r < min(ROWS, 8); ++r)
                         sh_red[warp][r][t * 16 + lane] = acc[t][r];
             }
+#endif
             __syncthreads();
 
             const int rows_out = MMODE == 0 ? 1 : min(size_m, ROWS);

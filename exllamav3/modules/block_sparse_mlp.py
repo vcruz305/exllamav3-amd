@@ -525,6 +525,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         H = self.hidden_size
         I = self.intermediate_size_padded
         rows = assignments // top_k
+        E_local = self.num_local_experts or self.num_experts
         self.hip_prefill_buffers = HIPPrefillBuffers(
             gu_had = g_tensor_cache.get(
                 device, (2 * assignments, H), torch.half, f"moe_gfx12_pf_gu_had_a{assignments}"),
@@ -534,15 +535,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 device, (assignments, H), torch.float, f"moe_gfx12_pf_down_out_a{assignments}"),
             output = g_tensor_cache.get(
                 device, (rows, H), torch.float, f"moe_gfx12_pf_output_a{rows}"),
+            # Sized to the resident expert count: an expert-range shard (CPU split) holds
+            # E_local < num_experts and the kernel asserts int64[E_local + 1]. Keyed on E so a
+            # split and an unsplit layer on the same device do not share the cache slot
             expert_offsets = g_tensor_cache.get(
-                device, (self.num_experts + 1,), torch.long, "moe_gfx12_pf_offsets"),
+                device, (E_local + 1,), torch.long, f"moe_gfx12_pf_offsets_e{E_local}"),
             inverse_order = g_tensor_cache.get(
                 device, (assignments,), torch.long, f"moe_gfx12_pf_inverse_a{assignments}"),
             expert_chunks = g_tensor_cache.get(
                 device,
-                (self.num_experts * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
+                (E_local * (_HIP_PREFILL_MAX_EXPERT_ROWS // 16),),
                 torch.int,
-                "moe_gfx12_pf_chunks",
+                f"moe_gfx12_pf_chunks_e{E_local}",
             ),
             chunk_count = g_tensor_cache.get(
                 device, (1,), torch.int, "moe_gfx12_pf_chunk_count"),
@@ -609,6 +613,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )) and
             self.cpu_split_first is None
         )
+        # CPU expert split (--moe_cpu_split): the module keeps the HEAD [0, first) experts and
+        # the pointer tables are built from that slice, so the grouped HIP kernels see a
+        # contiguous local range starting at 0 and mask picks >= experts to exact zeros (their
+        # rows go to the CPU partial that cpu_split_combine folds back in). Same partial-sum
+        # contract the CUDA fused path documents for expert-range shards. Without this the
+        # split layers fell to the reconstruct fallback (5x slower GPU side than the grouped
+        # kernel), which made offloading a net loss. EXL3_HIP_GROUPED_SPLIT=0 restores the gate.
+        cpu_head_split_layer = (
+            self.cpu_split_first is not None and
+            self.routing_first == 0 and self.routing_last == self.cpu_split_first and
+            len(self.ups) == self.cpu_split_first and
+            self.num_local_experts == self.cpu_split_first and
+            os.environ.get("EXL3_HIP_GROUPED_SPLIT", "1") != "0"
+        )
+        full_expert_layer = full_expert_layer or cpu_head_split_layer
         hip_grouped_device = False
         if (
             bool(torch.version.hip) and hasattr(ext, "exl3_moe_gfx12_k3") and
@@ -617,6 +636,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             device_index = torch.device(self.device).index
             if device_index is None:
                 device_index = torch.cuda.current_device()
+            # The grouped-MoE kernels launch exl3_gemv_kernel_body (ported to both
+            # WMMA families) plus elementwise helpers with no arch intrinsics, so
+            # any WMMA GEMV device qualifies. The shape checks below do the real
+            # filtering. NOTE: other gfx12-only kernels (routing, hyperconnection
+            # fusion) still need an explicit family-1 / arch-string test.
             hip_grouped_device = ext.exl3_gemv_supported(device_index)
         self.support_hip_grouped = (
             hip_grouped_device and self.is_quantized and self.gated and self.activation_fn == "silu" and
@@ -1224,7 +1248,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # eligible shapes.
         elif (
             self.support_hip_prefill and self.tp_mode is None and
-            self.num_local_experts == self.num_experts and
+            (self.num_local_experts == self.num_experts or
+             (self.cpu_split_first is not None and self.routing_first == 0 and
+              self.num_local_experts == self.cpu_split_first and
+              os.environ.get("EXL3_HIP_GROUPED_SPLIT", "1") != "0")) and
             _hip_prefill_rows_eligible(bsz) and
             y.dtype == torch.half and y.is_contiguous() and
             selected_experts.is_contiguous() and routing_weights.is_contiguous() and
@@ -1235,11 +1262,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         ):
             num_tokens, top_k = selected_experts.shape
             flat_expert_local = selected_experts.reshape(-1)
+            # Expert-range shard (CPU split keeps the head slice): picks outside [0, E_local)
+            # go to the sentinel bucket E_local so the kernel's per-expert counts and the
+            # metadata pass only cover the resident experts (the kernel zero-masks the rest)
+            E_local = self.num_local_experts or self.num_experts
+            if E_local != self.num_experts:
+                flat_expert_local = torch.where(
+                    flat_expert_local < E_local, flat_expert_local,
+                    torch.full_like(flat_expert_local, E_local))
             order = flat_expert_local.argsort(stable = True)
             if _moe_sync_free_count():
-                expert_count = _scatter_expert_count(flat_expert_local, self.num_experts + 1)
+                expert_count = _scatter_expert_count(flat_expert_local, E_local + 1)
             else:
-                expert_count = torch.bincount(flat_expert_local, minlength = self.num_experts + 1)
+                expert_count = torch.bincount(flat_expert_local, minlength = E_local + 1)
             buffers = self._ensure_hip_prefill_buffers(num_tokens)
             assignments = num_tokens * top_k
             output = buffers.output[:num_tokens]

@@ -92,6 +92,7 @@
 #include "quant/reconstruct.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemv.cuh"
+#include "quant/exl3_gemv_int8.cuh"
 
 #include "generator/strings.h"
 #include "generator/sampling_basic.cuh"
@@ -192,6 +193,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemv_supported", &exl3_gemv_supported, "exl3_gemv_supported");
+    m.def("exl3_gemv_wmma_family", &exl3_gemv_wmma_family, "exl3_gemv_wmma_family");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");
     m.def("exl3_gemm_shape_compat", &exl3_gemm_shape_compat, "exl3_gemm_shape_compat");
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
@@ -330,6 +332,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_r_128_batch", &had_r_128_batch, "had_r_128_batch");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemv_supported", &exl3_gemv_supported, "exl3_gemv_supported");
+    m.def("exl3_gemv_wmma_family", &exl3_gemv_wmma_family, "exl3_gemv_wmma_family");
+    m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
     m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
           "exl3_moe_gfx12_k3_prefill");

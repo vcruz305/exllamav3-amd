@@ -10,6 +10,7 @@
 // True when `device` can execute the GEMV tensor-core kernel. On ROCm this is limited to
 // the oracle-verified gfx1200/gfx1201 WMMA implementations.
 bool exl3_gemv_supported(int device);
+int exl3_gemv_wmma_family(int device);
 
 #if defined(USE_ROCM)
 // gfx12 decode/verification grouped MoE path for the Qwen3.8 Flash K3/mul1 expert shape.

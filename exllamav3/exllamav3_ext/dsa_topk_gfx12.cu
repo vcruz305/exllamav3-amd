@@ -158,9 +158,15 @@ bool is_gfx12_wave32(int device)
     hipDeviceProp_t prop;
     if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
     const char* arch = prop.gcnArchName;
-    const bool gfx12 = (!std::strncmp(arch, "gfx1200", 7) || !std::strncmp(arch, "gfx1201", 7)) &&
-                       (arch[7] == '\0' || arch[7] == ':');
-    return gfx12 && prop.warpSize == WAVE_SIZE;
+    // Only wave-width primitives here (__shfl*, warpSize); no RDNA4-only
+    // instruction, so any wave32 gfx11.5 / gfx12 part is valid.
+    auto is_arch = [arch](const char* name, size_t n) {
+        return !std::strncmp(arch, name, n) && (arch[n] == '\0' || arch[n] == ':');
+    };
+    const bool wave32_arch =
+        is_arch("gfx1200", 7) || is_arch("gfx1201", 7) ||
+        is_arch("gfx1150", 7) || is_arch("gfx1151", 7) || is_arch("gfx1152", 7);
+    return wave32_arch && prop.warpSize == WAVE_SIZE;
 }
 
 } // namespace
@@ -170,7 +176,7 @@ void dsa_topk_gfx12(const at::Tensor& scores, at::Tensor& indices)
     TORCH_CHECK(scores.is_cuda() && indices.is_cuda(), "dsa_topk_gfx12 requires device tensors");
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     const int device = scores.get_device();
-    TORCH_CHECK(is_gfx12_wave32(device), "dsa_topk_gfx12 requires gfx1200/gfx1201 with wave32");
+    TORCH_CHECK(is_gfx12_wave32(device), "dsa_topk_gfx12 requires a wave32 gfx11.5/gfx12 part");
     TORCH_CHECK(scores.device() == indices.device(), "dsa_topk_gfx12 tensors must share a device");
     TORCH_CHECK(scores.dtype() == at::kHalf && indices.dtype() == at::kInt,
                 "dsa_topk_gfx12 requires fp16 scores and int32 indices");

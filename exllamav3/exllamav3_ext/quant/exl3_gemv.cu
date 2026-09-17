@@ -6,6 +6,9 @@
 #endif
 #include "exl3_gemv.cuh"
 #include "hadamard.cuh"
+#if defined(USE_ROCM)
+#include "exl3_gemv_int8.cuh"   // fused int8-activation GEMV (mul1 tensors, m <= 2), opt-in via EXL3_INT8_GEMV
+#endif
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -20,6 +23,7 @@ namespace cg = cooperative_groups;
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <cstdlib>
 #include <mutex>
 #include <algorithm>
 
@@ -51,6 +55,25 @@ constexpr int MOE_PREFILL_MAX_EXPERT_ROWS = MOE_PREFILL_MAX_ROWS * MOE_TOP_K;
 constexpr int MOE_PREFILL_CHUNKS_PER_EXPERT =
     MOE_PREFILL_MAX_EXPERT_ROWS / MOE_PREFILL_ROWS_PER_CHUNK;
 constexpr int MOE_THREADS = 512;
+
+// Runtime k-split selection for the grouped-MoE decode GEMV. Default 0 keeps the
+// original 512-thread/WK=16 shape; 1 and 2 narrow it for small-CU parts.
+static inline int moe_decode_cfg()
+{
+    static const int cfg = [] {
+        const char* e = getenv("EXL3_MOE_CFG");
+        int v = e ? atoi(e) : 0;
+        return (v < 0 || v > 2) ? 0 : v;
+    }();
+    return cfg;
+}
+
+static inline int moe_decode_threads(int cfg)
+{
+    return cfg == 0 ? 512 : cfg == 1 ? 256 : 128;
+}
+
+
 constexpr float HAD_SCALE = 0.088388347648f;
 
 template <bool PRE_SCALE, bool FP32>
@@ -124,8 +147,11 @@ __global__ void moe_silu_mul_kernel(const half* gate, const half* up, half* outp
     }
 }
 
-template <bool FP32, bool TWO_PROJECTIONS>
-__global__ __launch_bounds__(MOE_THREADS)
+// MOE_CFG selects the k-split width WK (warps per block): 0 -> 16, 1 -> 8, 2 -> 4.
+// gfx1151 has only 20 CUs, where the widest split adds LDS pressure and cross-warp
+// reduction work without adding useful parallelism, so it is tunable at runtime.
+template <bool FP32, bool TWO_PROJECTIONS, int MOE_CFG = 0>
+__global__ __launch_bounds__(MOE_CFG == 0 ? 512 : MOE_CFG == 1 ? 256 : 128)
 void moe_grouped_gemv_k3_kernel
 (
     const half* A,
@@ -162,7 +188,7 @@ void moe_grouped_gemv_k3_kernel
 
     const uint16_t* B = reinterpret_cast<const uint16_t*>(B_ptr);
     const half* A_row = A + matrix * size_k;
-    exl3_gemv_kernel_body<3, FP32, 2, 0, 0, true>
+    exl3_gemv_kernel_body<3, FP32, 2, 0, MOE_CFG, true>
     (A_row, B, C_row, 1, size_k, size_n, nullptr, nullptr, nullptr, nullptr);
 }
 
@@ -491,7 +517,11 @@ void exl3_moe_gfx12_k3
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     int device;
     cuda_check(hipGetDevice(&device));
-    TORCH_CHECK(exl3_gemv_supported(device), "exl3_moe_gfx12_k3 requires gfx1200/gfx1201");
+    // Despite the name, this path only launches exl3_gemv_kernel_body (ported to
+    // every WMMA family) plus elementwise helpers with no arch intrinsics, so any
+    // device with a WMMA GEMV can run it.
+    TORCH_CHECK(exl3_gemv_wmma_family(device) != 0,
+                "exl3_moe_gfx12_k3 requires a WMMA GEMV arch (gfx1200/1201 or gfx1150/1151/1152)");
 
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
                 A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
@@ -567,9 +597,24 @@ void exl3_moe_gfx12_k3
      assignments, MOE_HIDDEN, experts, true);
 
     dim3 gu_grid(intermediate / 32, assignments, 2);
-    moe_grouped_gemv_k3_kernel<false, true><<<gu_grid, MOE_THREADS, 0, stream>>>
+    switch (moe_decode_cfg())
+    {
+    case 1:
+        moe_grouped_gemv_k3_kernel<false, true, 1><<<gu_grid, moe_decode_threads(1), 0, stream>>>
     (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
      gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+        break;
+    case 2:
+        moe_grouped_gemv_k3_kernel<false, true, 2><<<gu_grid, moe_decode_threads(2), 0, stream>>>
+    (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
+     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+        break;
+    default:
+        moe_grouped_gemv_k3_kernel<false, true, 0><<<gu_grid, moe_decode_threads(0), 0, stream>>>
+    (reinterpret_cast<const half*>(gu_had.data_ptr()), selected_ptr, gt, ut,
+     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+        break;
+    }
 
     moe_had_rows_kernel<false, false><<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
     (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, gsvh, usvh,
@@ -585,9 +630,24 @@ void exl3_moe_gfx12_k3
      assignments, intermediate, experts, false);
 
     dim3 down_grid(MOE_HIDDEN / 32, assignments, 1);
-    moe_grouped_gemv_k3_kernel<true, false><<<down_grid, MOE_THREADS, 0, stream>>>
+    switch (moe_decode_cfg())
+    {
+    case 1:
+        moe_grouped_gemv_k3_kernel<true, false, 1><<<down_grid, moe_decode_threads(1), 0, stream>>>
     (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
      down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+        break;
+    case 2:
+        moe_grouped_gemv_k3_kernel<true, false, 2><<<down_grid, moe_decode_threads(2), 0, stream>>>
+    (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
+     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+        break;
+    default:
+        moe_grouped_gemv_k3_kernel<true, false, 0><<<down_grid, moe_decode_threads(0), 0, stream>>>
+    (reinterpret_cast<const half*>(down_had.data_ptr()), selected_ptr, dt, dt,
+     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+        break;
+    }
 
     moe_had_rows_kernel<false, true><<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
     (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, dsvh, dsvh,
@@ -629,8 +689,8 @@ void exl3_moe_gfx12_k3_prefill
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     int device;
     cuda_check(hipGetDevice(&device));
-    TORCH_CHECK(exl3_gemv_supported(device),
-                "exl3_moe_gfx12_k3_prefill requires gfx1200/gfx1201");
+    TORCH_CHECK(exl3_gemv_wmma_family(device) != 0,
+                "exl3_moe_gfx12_k3_prefill requires a WMMA GEMV arch (gfx1200/1201 or gfx1150/1151/1152)");
 
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
                 A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
@@ -800,22 +860,42 @@ static bool exl3_gemv_debug()
     return enabled;
 }
 
+// Which WMMA family does this device have? The two are NOT interchangeable:
+// different builtins, different A/B widths, different C row mapping.
+//   0 = none, 1 = gfx12 (RDNA4), 2 = gfx11.5 (RDNA3.5 / Strix Halo)
+int exl3_gemv_wmma_family(int device)
+{
+#if defined(USE_ROCM)
+    static std::map<int, int> family_cache;
+    static std::mutex family_cache_mtx;
+    std::lock_guard<std::mutex> lock(family_cache_mtx);
+    auto it = family_cache.find(device);
+    if (it != family_cache.end()) return it->second;
+
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, device) != hipSuccess) return 0;
+    const char* arch = prop.gcnArchName;
+    auto is = [&](const char* name) {
+        const size_t n = std::strlen(name);
+        return !std::strncmp(arch, name, n) && (arch[n] == '\0' || arch[n] == ':');
+    };
+    int family = 0;
+    if (is("gfx1200") || is("gfx1201")) family = 1;
+    else if (is("gfx1150") || is("gfx1151") || is("gfx1152")) family = 2;
+    family_cache[device] = family;
+    return family;
+#else
+    (void) device;
+    return 1;
+#endif
+}
+
+// True when the EXL3 WMMA GEMV can run. NOTE: the gfx12-only MoE/routing entry
+// points must check exl3_gemv_wmma_family(device) == 1 instead of this.
 bool exl3_gemv_supported(int device)
 {
 #if defined(USE_ROCM)
-    static std::map<int, bool> support_cache;
-    static std::mutex support_cache_mtx;
-    std::lock_guard<std::mutex> lock(support_cache_mtx);
-    auto it = support_cache.find(device);
-    if (it != support_cache.end()) return it->second;
-
-    hipDeviceProp_t prop;
-    if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
-    const char* arch = prop.gcnArchName;
-    bool supported = (!std::strncmp(arch, "gfx1200", 7) || !std::strncmp(arch, "gfx1201", 7))
-        && (arch[7] == '\0' || arch[7] == ':');
-    support_cache[device] = supported;
-    return supported;
+    return exl3_gemv_wmma_family(device) != 0;
 #else
     (void) device;
     return true;
@@ -1123,6 +1203,17 @@ void exl3_gemv
     int* locks = DevCtx::instance().get_locks(device);
 
 #if defined(USE_ROCM)
+    // Same gate as the CUDA exl3_gemm call site: the fused int8 kernel does its own input Hadamard
+    // (from A with suh) and output Hadamard (svh), so it must run BEFORE the had_r_128 pre-pass
+    // below and returns the finished C. Off unless EXL3_INT8_GEMV is set to 1 or 2 on ROCm
+    if (mul1 && exl3_gemv_int8_enabled())
+    {
+        if (exl3_gemv_int8(A, B, C, suh, A_had, svh, stream, nullptr))
+        {
+            cuda_check(hipPeekAtLastError());
+            return;
+        }
+    }
     at::Tensor A_view = A.view({size_m, size_k});
     at::Tensor A_had_view = A_had.value().view({size_m, size_k});
     had_r_128(A_view, A_had_view, suh, c10::nullopt, 1.0f);

@@ -7,11 +7,16 @@ import os
 
 ROCM_EXCLUDE_DIRS = {'parallel', 'comp_units'}
 
+# Files inside an excluded dir that DO build on ROCm (checked before the dir exclusion). The int8
+# GEMV instantiations only depend on exl3_gemv_int8_kernel.cuh, which has a HIP path; the other
+# comp_units (exl3_moe_*, quantize_tiles_*, exl3_comp_unit_*) pull in CUDA-only headers and stay out.
+ROCM_ALLOW_PREFIXES = ('quant/comp_units/exl3_gemv_int8_inst_',)
+
 ROCM_EXCLUDE_FILES = {
     'norm.cu', 'activation.cu', 'attention.cu', 'routing.cu',
     'softcap.cu', 'histogram.cu', 'sam.cpp',
     'cache/q_cache.cu',
-    'quant/exl3_gemm.cu', 'quant/exl3_gemv_int8.cu',
+    'quant/exl3_gemm.cu',
     'quant/exl3_moe.cu', 'quant/exl3_moe_coop.cu', 'quant/exl3_kernel_map.cu',
     'quant/coop_autotune.cu', 'quant/quantize.cu', 'quant/util.cu',
     'generator/sampling_fused.cu',
@@ -45,12 +50,12 @@ def get_sources(sources_dir, is_rocm, base_dir=None):
                 continue
             rel_path = os.path.relpath(os.path.join(root, file), start=sources_dir)
             norm_rel = rel_path.replace('\\', '/')
-            if is_rocm:
+            if is_rocm and not norm_rel.startswith(ROCM_ALLOW_PREFIXES):
                 parts = norm_rel.split('/')
                 if any(d in parts for d in ROCM_EXCLUDE_DIRS):
                     continue
-                if norm_rel in ROCM_EXCLUDE_FILES:
-                    continue
+            if is_rocm and norm_rel in ROCM_EXCLUDE_FILES:
+                continue
             full = os.path.join(root, file)
             if base_dir is not None:
                 sources.append(os.path.relpath(full, start=base_dir))
