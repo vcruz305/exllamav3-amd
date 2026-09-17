@@ -31,13 +31,22 @@ for R, x in xs.items():
     out.append(f"R={R} {tot/40*1000:7.1f}us")
 print("RES " + "  ".join(out))
 '''
-for label, env in [
-    ("MIN_ROWS=2 CFG=2 (current)", {"EXL3_HIP_PREFILL_MIN_ROWS": "2", "EXL3_MOE_CFG": "2"}),
-    ("MIN_ROWS=17 CFG=2 (decode kernel)", {"EXL3_HIP_PREFILL_MIN_ROWS": "17", "EXL3_MOE_CFG": "2"}),
-    ("MIN_ROWS=17 CFG=1", {"EXL3_HIP_PREFILL_MIN_ROWS": "17", "EXL3_MOE_CFG": "1"}),
-    ("MIN_ROWS=17 CFG=0", {"EXL3_HIP_PREFILL_MIN_ROWS": "17", "EXL3_MOE_CFG": "0"}),
-    ("MIN_ROWS=3 CFG=2", {"EXL3_HIP_PREFILL_MIN_ROWS": "3", "EXL3_MOE_CFG": "2"}),
-]:
+import sys
+SETS = {
+    "minrows": [
+        ("MIN_ROWS=2 CFG=2 (current)", {"EXL3_HIP_PREFILL_MIN_ROWS": "2", "EXL3_MOE_CFG": "2"}),
+        ("MIN_ROWS=17 CFG=2 (decode kernel)", {"EXL3_HIP_PREFILL_MIN_ROWS": "17", "EXL3_MOE_CFG": "2"}),
+        ("MIN_ROWS=17 CFG=1", {"EXL3_HIP_PREFILL_MIN_ROWS": "17", "EXL3_MOE_CFG": "1"}),
+        ("MIN_ROWS=17 CFG=0", {"EXL3_HIP_PREFILL_MIN_ROWS": "17", "EXL3_MOE_CFG": "0"}),
+        ("MIN_ROWS=3 CFG=2", {"EXL3_HIP_PREFILL_MIN_ROWS": "3", "EXL3_MOE_CFG": "2"}),
+    ],
+    "prefillcfg": [
+        ("PREFILL_CFG=2 (current)", {"EXL3_HIP_PREFILL_MIN_ROWS": "2", "EXL3_MOE_PREFILL_CFG": "2"}),
+        ("PREFILL_CFG=1", {"EXL3_HIP_PREFILL_MIN_ROWS": "2", "EXL3_MOE_PREFILL_CFG": "1"}),
+        ("PREFILL_CFG=0", {"EXL3_HIP_PREFILL_MIN_ROWS": "2", "EXL3_MOE_PREFILL_CFG": "0"}),
+    ],
+}
+for label, env in SETS[sys.argv[1] if len(sys.argv) > 1 else "minrows"]:
     r = subprocess.run([py, "-c", WORKER], capture_output=True, text=True, env=dict(os.environ, **env), timeout=900)
     res = [l for l in r.stdout.splitlines() if l.startswith("RES ")]
     print(f"{label:36} {res[0][4:] if res else 'FAIL ' + r.stderr[-300:]}")

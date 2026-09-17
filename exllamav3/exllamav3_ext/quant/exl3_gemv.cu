@@ -73,6 +73,19 @@ static inline int moe_decode_threads(int cfg)
     return cfg == 0 ? 512 : cfg == 1 ? 256 : 128;
 }
 
+// Same knob for the grouped-MoE PREFILL GEMV (MMODE 2, 16-row expert chunks), which the MTP
+// verify batches take via EXL3_HIP_PREFILL_MIN_ROWS=2. It was hardcoded to CFG 2 (4 warps,
+// 64 columns per block) and never swept on gfx1151. EXL3_MOE_PREFILL_CFG=0/1/2, default 2.
+static inline int moe_prefill_cfg()
+{
+    static const int cfg = [] {
+        const char* e = getenv("EXL3_MOE_PREFILL_CFG");
+        int v = e ? atoi(e) : 2;
+        return (v < 0 || v > 2) ? 2 : v;
+    }();
+    return cfg;
+}
+
 
 constexpr float HAD_SCALE = 0.088388347648f;
 
@@ -259,25 +272,52 @@ __global__ void moe_prefill_metadata_kernel
             inverse_order[original_slot] = idx;
     }
 
-    if (blockIdx.x == 0 && threadIdx.x == 0)
+    // Block 0 builds expert_offsets (exclusive scan of counts) and the compacted chunk list
+    // with a block-wide scan. The previous single-thread loop over 512 experts took ~31 us
+    // per call on gfx1151 = ~1.5 ms per MTP round across 48 layers.
+    if (blockIdx.x != 0) return;
+    __shared__ int64_t warp_off[32];
+    __shared__ int warp_chk[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    int64_t run_off = 0;
+    int run_chk = 0;
+    if (threadIdx.x == 0) expert_offsets[0] = 0;
+    for (int base = 0; base < experts; base += blockDim.x)
     {
-        int64_t offset = 0;
-        int num_chunks = 0;
-        expert_offsets[0] = 0;
-        for (int expert = 0; expert < experts; ++expert)
+        const int e = base + threadIdx.x;
+        const int64_t count = e < experts ? expert_count[e] : 0;
+        const int nch = (e < experts && count > 0 && count <= MOE_PREFILL_MAX_EXPERT_ROWS)
+            ? (int) ((count + MOE_PREFILL_ROWS_PER_CHUNK - 1) / MOE_PREFILL_ROWS_PER_CHUNK) : 0;
+        // inclusive warp scans
+        int64_t so = count; int sc = nch;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1)
         {
-            const int64_t count = expert_count[expert];
-            offset += count;
-            expert_offsets[expert + 1] = offset;
-            if (count > 0 && count <= MOE_PREFILL_MAX_EXPERT_ROWS)
-                for (int chunk = 0;
-                     chunk * MOE_PREFILL_ROWS_PER_CHUNK < count; ++chunk)
-                    expert_chunks[num_chunks++] =
-                        expert * MOE_PREFILL_CHUNKS_PER_EXPERT + chunk;
+            const int64_t to = __shfl_up_sync(0xffffffffu, so, o);
+            const int tc = __shfl_up_sync(0xffffffffu, sc, o);
+            if (lane >= o) { so += to; sc += tc; }
         }
-        *num_chunks_out = num_chunks;
+        if (lane == 31) { warp_off[warp] = so; warp_chk[warp] = sc; }
+        __syncthreads();
+        int64_t wbase_o = run_off; int wbase_c = run_chk;
+        for (int w = 0; w < warp; ++w) { wbase_o += warp_off[w]; wbase_c += warp_chk[w]; }
+        const int64_t excl_o = wbase_o + so - count;
+        const int excl_c = wbase_c + sc - nch;
+        if (e < experts)
+        {
+            expert_offsets[e + 1] = excl_o + count;
+            for (int c = 0; c < nch; ++c)
+                expert_chunks[excl_c + c] = e * MOE_PREFILL_CHUNKS_PER_EXPERT + c;
+        }
+        __syncthreads();
+        for (int w = 0; w < nwarps; ++w) { run_off += warp_off[w]; run_chk += warp_chk[w]; }
+        __syncthreads();
     }
+    if (threadIdx.x == 0) *num_chunks_out = run_chk;
 }
+
 
 template <bool PRE_SCALE, bool FP32>
 __global__ __launch_bounds__(32)
@@ -801,11 +841,19 @@ void exl3_moe_gfx12_k3_prefill
     // old bound.
     const int chunk_slots = std::min(
         CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts, assignments);
-    dim3 gu_grid(intermediate / 64, chunk_slots, 2);
-    moe_prefill_grouped_gemv_k3_kernel<false, true, 2><<<gu_grid, 128, 0, stream>>>
-    (reinterpret_cast<const half*>(gu_had.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
-     gt, ut,
-     gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments);
+    const int pcfg = moe_prefill_cfg();
+    const int pcols = pcfg == 0 ? 32 : 64;          // COLS = WNT * 16 in exl3_gemv_kernel_body
+    dim3 gu_grid(intermediate / pcols, chunk_slots, 2);
+    #define PREFILL_GU_ARGS \
+        reinterpret_cast<const half*>(gu_had.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr, \
+        gt, ut, gu_out.data_ptr(), MOE_HIDDEN, intermediate, experts, assignments
+    switch (pcfg)
+    {
+        case 0: moe_prefill_grouped_gemv_k3_kernel<false, true, 0><<<gu_grid, 512, 0, stream>>>(PREFILL_GU_ARGS); break;
+        case 1: moe_prefill_grouped_gemv_k3_kernel<false, true, 1><<<gu_grid, 256, 0, stream>>>(PREFILL_GU_ARGS); break;
+        default: moe_prefill_grouped_gemv_k3_kernel<false, true, 2><<<gu_grid, 128, 0, stream>>>(PREFILL_GU_ARGS); break;
+    }
+    #undef PREFILL_GU_ARGS
 
     moe_prefill_had_rows_kernel<false, false>
         <<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
@@ -822,11 +870,17 @@ void exl3_moe_gfx12_k3_prefill
     (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsuh, dsuh,
      assignments, intermediate, experts, false);
 
-    dim3 down_grid(MOE_HIDDEN / 64, chunk_slots, 1);
-    moe_prefill_grouped_gemv_k3_kernel<true, false, 2><<<down_grid, 128, 0, stream>>>
-    (reinterpret_cast<const half*>(gu_out.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr,
-     dt, dt,
-     down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments);
+    dim3 down_grid(MOE_HIDDEN / pcols, chunk_slots, 1);
+    #define PREFILL_DN_ARGS \
+        reinterpret_cast<const half*>(gu_out.data_ptr()), offsets_ptr, chunks_ptr, chunk_count_ptr, \
+        dt, dt, down_out.data_ptr(), intermediate, MOE_HIDDEN, experts, assignments
+    switch (pcfg)
+    {
+        case 0: moe_prefill_grouped_gemv_k3_kernel<true, false, 0><<<down_grid, 512, 0, stream>>>(PREFILL_DN_ARGS); break;
+        case 1: moe_prefill_grouped_gemv_k3_kernel<true, false, 1><<<down_grid, 256, 0, stream>>>(PREFILL_DN_ARGS); break;
+        default: moe_prefill_grouped_gemv_k3_kernel<true, false, 2><<<down_grid, 128, 0, stream>>>(PREFILL_DN_ARGS); break;
+    }
+    #undef PREFILL_DN_ARGS
 
     moe_prefill_had_rows_kernel<false, true>
         <<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>

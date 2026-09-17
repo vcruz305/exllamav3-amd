@@ -6,7 +6,7 @@ source env.sh build > /dev/null
 export PYTHONPATH="$PWD"
 export EXL3_HIP_DEFINES="${EXL3_HIP_DEFINES:-EXL3_HIP_STG_PAD}"
 # Regenerate hipify twins of the files we edit here (the .hip is gitignored, generated from the .cu)
-for f in hgemm hc_mix; do rm -f exllamav3/exllamav3_ext/$f.hip exllamav3/exllamav3_ext/${f}_hip.cuh; find build -name "$f*.o" -delete 2>/dev/null; done
+for f in hgemm hc_mix quant/exl3_gemv; do rm -f exllamav3/exllamav3_ext/$f.hip exllamav3/exllamav3_ext/${f}_hip.cuh; find build -name "$f*.o" -delete 2>/dev/null; done
 rm -f exllamav3/exllamav3_ext/bindings_hip.cpp; find build -name "bindings*.o" -delete 2>/dev/null
 if [ "${FULL:-0}" = "1" ]; then
     # header change (exl3_gemv_kernel.cuh): every HIP TU that includes it must rebuild
