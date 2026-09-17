@@ -321,7 +321,25 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
         x_src_b = i2 % 24;
     }
 
-    __shared__ float sh_red[WK][RED_ROWS][COLS];
+    // LDS banks: 32 x 1 dword, bank = dword_addr % 32. float is one dword, so the
+    // innermost extent is the stride between consecutive rows -- and the per-warp
+    // stride for the cross-warp reduce below is RED_ROWS*COLS. With COLS a multiple
+    // of 32 that product is too, so every warp's slice shares one bank:
+    //
+    //   for (j = 0; j < WK; ++j) sum += sh_red[j][r][c];   // fixed r, c
+    //
+    //   COLS=64 (CFG2): 512-dword stride -> 1 bank for WK accesses  -> WK-way
+    //   COLS=65       : 520-dword stride -> WK distinct banks       -> clean
+    //
+    // Padding by one dword costs +128 B at CFG=2 (+512 B at CFG=0).
+    // The store path is 2-way regardless (16 distinct c over 32 lanes) -- inherent
+    // to the fragment layout, not addressed here.
+#if defined(EXL3_HIP_RED_PAD) && defined(USE_ROCM)
+    #define EXL3_RED_COLS (COLS + 1)
+#else
+    #define EXL3_RED_COLS COLS
+#endif
+    __shared__ float sh_red[WK][RED_ROWS][EXL3_RED_COLS];
 #if defined(USE_ROCM) || defined(__HIPCC__)
     // HIP: staged extraction always on (gfx12 WMMA operands must not come from __shfl_sync;
     // see hip_mma.cuh). SMEM_STAGE is ignored and the staging buffer is unconditional.
@@ -768,3 +786,5 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
     (A, B, C, size_m, size_k, size_n, locks, suh, A_had, svh);
 }
 #endif
+
+#undef EXL3_RED_COLS

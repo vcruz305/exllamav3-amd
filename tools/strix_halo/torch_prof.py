@@ -49,7 +49,7 @@ def main():
     t0 = time.time()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                  record_shapes=False, with_stack=False) as prof:
-        gen.enqueue(Job(input_ids=ids, max_new_tokens=24, sampler=GreedySampler()))
+        gen.enqueue(Job(input_ids=ids, max_new_tokens=96, sampler=GreedySampler()))
         n = 0
         while gen.num_remaining_jobs():
             for r in gen.iterate():
@@ -70,22 +70,22 @@ def main():
     print(f"=> device busy {100*dev_total/1e6/wall:.1f}% of wall")
     print()
 
-    print("TOP 14 BY SELF DEVICE TIME")
+    print("TOP 28 BY SELF DEVICE TIME")
     print(f"{'op':>42} {'calls':>7} {'dev_ms':>9} {'us/call':>9}")
     print("-" * 72)
     rows = sorted(ka, key=lambda e: -(getattr(e, "self_device_time_total", 0) or 0))
-    for e in rows[:14]:
+    for e in rows[:28]:
         d = (getattr(e, "self_device_time_total", 0) or 0) / 1000
         if d <= 0:
             continue
         print(f"{e.key[:42]:>42} {e.count:>7} {d:>9.1f} {d*1000/max(e.count,1):>9.1f}")
 
     print()
-    print("TOP 14 BY SELF CPU TIME (host overhead candidates)")
+    print("TOP 28 BY SELF CPU TIME (host overhead candidates)")
     print(f"{'op':>42} {'calls':>7} {'cpu_ms':>9} {'us/call':>9}")
     print("-" * 72)
     rows = sorted(ka, key=lambda e: -e.self_cpu_time_total)
-    for e in rows[:14]:
+    for e in rows[:28]:
         c = e.self_cpu_time_total / 1000
         print(f"{e.key[:42]:>42} {e.count:>7} {c:>9.1f} {c*1000/max(e.count,1):>9.1f}")
 

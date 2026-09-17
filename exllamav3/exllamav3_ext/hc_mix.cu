@@ -6,6 +6,8 @@
 #endif
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <algorithm>
 #include "hc_mix.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -563,6 +565,335 @@ void hc_apply_kernel
     }
 }
 
+
+#if defined(USE_ROCM)
+
+/*
+Row-looped GatedResidual mix for small-CU parts (gfx1151: 20 CUs, 236 GB/s). The reference
+gr_dots / gr_finalize launch a (.., R) grid and re-read the 6.3 MiB fn and 6.2 MiB upt once
+PER ROW, and gr_dots' one-block-per-fn-row shape (128 threads, ~10 dependent load rounds,
+per-h serial chains) ran at ~46 GB/s. Measured 211 us at R=1 / 233 us at R=3 for a 56 us
+one-read roofline; at ~17% of decode device time under MTP this was the second-largest
+kernel after the grouped MoE.
+
+  gr_dots_rows:     warp per (fn row j, stream h) dot product, lanes stride the D axis with
+                    16-byte fn loads, ALL R rows accumulated by the same warp so fn is read
+                    once; the sum-of-squares rows ride along as j == M.
+  gr_finalize_rows: grid over column chunks only; every block derives rmr / t for all R
+                    rows redundantly (tiny), then the warp-per-column-quad rank loop keeps
+                    R x H float4 accumulators so upt is read once for all rows.
+
+Numerics: same fp32 accumulate, different summation order -> not bit-identical to the
+reference kernels, same class of error (parity checked against _mix_ref in gr_mix_micro.py).
+EXL3_HIP_GR_MIX_ROWS=1 enables it (default off, see gr_mix_rows_enabled).
+*/
+
+#define GR_ROWS_WARPS 8
+#define GR_ROWS_FN_MAX 10        // D <= 10 * 256 = 2560 on the rows path (VGPR budget)
+#define GR_ROWS_LR_TILE 5        // ranks per lane hoisted per tile (LR = 320 -> 2 tiles)
+#define GR_ROWS_THREADS (GR_ROWS_WARPS * 32)
+
+template <int H, int RMAX>
+__global__ __launch_bounds__(GR_ROWS_THREADS)
+void gr_dots_rows_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const half* __restrict__ fn,         // (M, H * D) half, norm weight folded in
+    float* __restrict__ dots,            // (R, M + 1, H)
+    const int R,
+    const int M,
+    const int D
+)
+{
+    // Block = one stream h x GR_ROWS_WARPS consecutive fn rows j. The block stages
+    // streams[0..R, h, :] in LDS once (R x D fp32), so the per-fn-element stream reads
+    // that dominated the L2 traffic of the per-row layout (every warp re-read its 10 KiB
+    // slice: 13 MiB of L2 reads per call at R=1, 39 MiB at R=3) come from LDS instead.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int h = blockIdx.y;
+    const int j = blockIdx.x * GR_ROWS_WARPS + warp;
+    const size_t stream_stride = (size_t) H * D;
+
+    extern __shared__ float4 s_stream4[];             // [RMAX][D / 4]
+    const int D4 = D / 4;
+    for (int idx = threadIdx.x; idx < R * D4; idx += GR_ROWS_THREADS)
+    {
+        const int r = idx / D4, c = idx % D4;
+        s_stream4[r * D4 + c] = ((const float4*) (streams + (size_t) r * stream_stride + (size_t) h * D))[c];
+    }
+    __syncthreads();
+    if (j > M) return;
+
+    float acc[RMAX];
+    #pragma unroll
+    for (int r = 0; r < RMAX; ++r) acc[r] = 0.0f;
+
+    if (j < M)
+    {
+        // fn is the DRAM traffic: issue all of this lane's 16-byte fn loads up front
+        // (D / 256 per lane, <= GR_ROWS_FN_MAX) so they overlap, then consume from LDS.
+        const int4* f8 = (const int4*) (fn + ((size_t) j * H + h) * D);
+        const int steps = D / 256;                 // D % 256 == 0 checked by the launcher
+        int4 pk[GR_ROWS_FN_MAX];
+        #pragma unroll
+        for (int t = 0; t < GR_ROWS_FN_MAX; ++t)
+            if (t < steps) pk[t] = f8[lane + t * 32];
+        #pragma unroll
+        for (int t = 0; t < GR_ROWS_FN_MAX; ++t)
+        {
+            if (t >= steps) break;
+            const int c = lane + t * 32;               // 8-element chunk index
+            const half4 w0 = *(const half4*) &pk[t].x;
+            const half4 w1 = *(const half4*) &pk[t].z;
+            const float f0 = LOW_TO_FLOAT(w0.x), f1 = HIGH_TO_FLOAT(w0.x);
+            const float f2 = LOW_TO_FLOAT(w0.y), f3 = HIGH_TO_FLOAT(w0.y);
+            const float f4 = LOW_TO_FLOAT(w1.x), f5 = HIGH_TO_FLOAT(w1.x);
+            const float f6 = LOW_TO_FLOAT(w1.y), f7 = HIGH_TO_FLOAT(w1.y);
+            #pragma unroll
+            for (int r = 0; r < RMAX; ++r)
+            {
+                if (r < R)
+                {
+                    const float4 s0 = s_stream4[r * D4 + 2 * c];
+                    const float4 s1 = s_stream4[r * D4 + 2 * c + 1];
+                    float a = acc[r];
+                    a = fmaf(s0.x, f0, a); a = fmaf(s0.y, f1, a);
+                    a = fmaf(s0.z, f2, a); a = fmaf(s0.w, f3, a);
+                    a = fmaf(s1.x, f4, a); a = fmaf(s1.y, f5, a);
+                    a = fmaf(s1.z, f6, a); a = fmaf(s1.w, f7, a);
+                    acc[r] = a;
+                }
+            }
+        }
+    }
+    else
+    {
+        #pragma unroll
+        for (int r = 0; r < RMAX; ++r)
+        {
+            if (r < R)
+            {
+                float a = 0.0f;
+                for (int c = lane; c < D4; c += 32)
+                {
+                    const float4 sv = s_stream4[r * D4 + c];
+                    a = fmaf(sv.x, sv.x, fmaf(sv.y, sv.y, fmaf(sv.z, sv.z, fmaf(sv.w, sv.w, a))));
+                }
+                acc[r] = a;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < RMAX; ++r)
+    {
+        float a = acc[r];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            a += __shfl_xor_sync(0xffffffffu, a, offset);
+        acc[r] = a;
+    }
+    if (lane == 0)
+    {
+        #pragma unroll
+        for (int r = 0; r < RMAX; ++r)
+            if (r < R) dots[((size_t) r * (M + 1) + j) * H + h] = acc[r];
+    }
+}
+
+template <int H, int RMAX, bool HALF_OUT>
+__global__ __launch_bounds__(NUM_THREADS)
+void gr_finalize_rows_kernel
+(
+    const float* __restrict__ streams,   // (R, H, D)
+    const float* __restrict__ dots,      // (R, M + 1, H)
+    const half* __restrict__ upt,        // (H, D / 4, LR, 4) half
+    const half* __restrict__ w,          // (H * D) half
+    float* __restrict__ post,            // (R, H) or nullptr
+    void* __restrict__ mixed,            // (R, D) half or float
+    const int R,
+    const int D,
+    const int LR,
+    const int chunk_cols,
+    const float rms_eps
+)
+{
+    const int M = LR + (post ? H : 0);
+    const float inv_h = 1.0f / (float) H;
+
+    __shared__ float rmr_s[RMAX][H];
+    extern __shared__ float t_s[];       // [RMAX][LR]
+    if (threadIdx.x < RMAX * H)
+    {
+        const int r = threadIdx.x / H, h = threadIdx.x % H;
+        rmr_s[r][h] = r < R
+            ? rsqrtf(dots[((size_t) r * (M + 1) + M) * H + h] / (float) D + rms_eps)
+            : 0.0f;
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < R * LR; idx += NUM_THREADS)
+    {
+        const int r = idx / LR, i = idx % LR;
+        const float* dr = dots + (size_t) r * (M + 1) * H;
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            v = fmaf(rmr_s[r][h], dr[(size_t) i * H + h], v);
+        v *= inv_h;
+        t_s[r * LR + i] = v * sigmoidf_(v);
+    }
+    if (post && blockIdx.x == 0 && threadIdx.x < R * H)
+    {
+        const int r = threadIdx.x / H, hh = threadIdx.x % H;
+        const float* dr = dots + (size_t) r * (M + 1) * H;
+        float v = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            v = fmaf(rmr_s[r][h], dr[(size_t) (LR + hh) * H + h], v);
+        post[(size_t) r * H + hh] = 2.0f * sigmoidf_(v * inv_h);
+    }
+    __syncthreads();
+
+    const int c0 = blockIdx.x * chunk_cols;
+    const int c1 = min(c0 + chunk_cols, D);
+    const int D4 = D / 4;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    for (int c = c0 / 4 + warp; c < c1 / 4; c += NUM_THREADS / 32)
+    {
+        float4 g[RMAX][H];
+        #pragma unroll
+        for (int r = 0; r < RMAX; ++r)
+            #pragma unroll
+            for (int h = 0; h < H; ++h) g[r][h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+        // upt is the traffic here: hoist the H loads of a whole tile of GR_ROWS_LR_TILE ranks
+        // before consuming, so each lane keeps H * tile 8-byte loads in flight
+        for (int i0 = 0; i0 < LR; i0 += 32 * GR_ROWS_LR_TILE)
+        {
+            half4 u[GR_ROWS_LR_TILE][H];
+            #pragma unroll
+            for (int t = 0; t < GR_ROWS_LR_TILE; ++t)
+            {
+                const int i = i0 + t * 32 + lane;
+                #pragma unroll
+                for (int h = 0; h < H; ++h)
+                    u[t][h] = i < LR
+                        ? *(const half4*) (upt + ((((size_t) h * D4 + c) * LR + i) * 4))
+                        : half4(__float2half(0.0f), __float2half(0.0f), __float2half(0.0f), __float2half(0.0f));
+            }
+            #pragma unroll
+            for (int t = 0; t < GR_ROWS_LR_TILE; ++t)
+            {
+            const int i = i0 + t * 32 + lane;
+            if (i >= LR) break;
+            #pragma unroll
+            for (int r = 0; r < RMAX; ++r)
+            {
+                if (r < R)
+                {
+                    const float ti = t_s[r * LR + i];
+                    #pragma unroll
+                    for (int h = 0; h < H; ++h)
+                    {
+                        g[r][h].x = fmaf(ti, LOW_TO_FLOAT(u[t][h].x), g[r][h].x);
+                        g[r][h].y = fmaf(ti, HIGH_TO_FLOAT(u[t][h].x), g[r][h].y);
+                        g[r][h].z = fmaf(ti, LOW_TO_FLOAT(u[t][h].y), g[r][h].z);
+                        g[r][h].w = fmaf(ti, HIGH_TO_FLOAT(u[t][h].y), g[r][h].w);
+                    }
+                }
+            }
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < RMAX; ++r)
+            #pragma unroll
+            for (int h = 0; h < H; ++h)
+                for (int offset = 16; offset > 0; offset >>= 1)
+                {
+                    g[r][h].x += __shfl_xor_sync(0xffffffffu, g[r][h].x, offset);
+                    g[r][h].y += __shfl_xor_sync(0xffffffffu, g[r][h].y, offset);
+                    g[r][h].z += __shfl_xor_sync(0xffffffffu, g[r][h].z, offset);
+                    g[r][h].w += __shfl_xor_sync(0xffffffffu, g[r][h].w, offset);
+                }
+
+        // lane r finishes row r (every lane holds the full sums after the xor reduce)
+        #pragma unroll
+        for (int r = 0; r < RMAX; ++r)
+        {
+            if (r < R && lane == r)
+            {
+                const float4* s4 = (const float4*) (streams + (size_t) r * H * D);
+                float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                #pragma unroll
+                for (int h = 0; h < H; ++h)
+                {
+                    const float4 sv = s4[(size_t) h * D4 + c];
+                    const half4 wq = *(const half4*) (w + (size_t) h * D + 4 * c);
+                    const float coef = rmr_s[r][h] * inv_h;
+                    o.x = fmaf(sigmoidf_(g[r][h].x) * coef * LOW_TO_FLOAT(wq.x),  sv.x, o.x);
+                    o.y = fmaf(sigmoidf_(g[r][h].y) * coef * HIGH_TO_FLOAT(wq.x), sv.y, o.y);
+                    o.z = fmaf(sigmoidf_(g[r][h].z) * coef * LOW_TO_FLOAT(wq.y),  sv.z, o.z);
+                    o.w = fmaf(sigmoidf_(g[r][h].w) * coef * HIGH_TO_FLOAT(wq.y), sv.w, o.w);
+                }
+                if (HALF_OUT)
+                {
+                    half2* out2 = (half2*) ((half*) mixed + (size_t) r * D);
+                    out2[c * 2] = __floats2half2_rn(o.x, o.y);
+                    out2[c * 2 + 1] = __floats2half2_rn(o.z, o.w);
+                }
+                else
+                    ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
+            }
+        }
+    }
+}
+
+static bool gr_mix_rows_enabled()
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        // Default OFF: measured a null on gfx1151 (in-model gr_dots already ran at ~88 GB/s,
+        // the practical single-kernel read rate for a 6 MiB working set on this part; the
+        // row-looped version was 42.0 vs 44.0 tok/s end to end). Kept for parts with more CUs.
+        const char* e = getenv("EXL3_HIP_GR_MIX_ROWS");
+        cached = (e && *e == '1') ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+template <int RMAX>
+static void gr_mix_rows_launch
+(
+    const float* streams, const half* fn, const half* upt, const half* w, float* dots, float* post,
+    void* mixed, bool half_out, int R, int M, int D, int LR, float rms_eps, cudaStream_t stream
+)
+{
+    dim3 grid_a((M + 1 + GR_ROWS_WARPS - 1) / GR_ROWS_WARPS, 4);
+    const int smem_a = R * D * sizeof(float);
+    gr_dots_rows_kernel<4, RMAX><<<grid_a, GR_ROWS_THREADS, smem_a, stream>>>(streams, fn, dots, R, M, D);
+    cuda_check(cudaPeekAtLastError());
+
+    // One column quad per warp per pass; spread the quads over as many blocks as the device
+    // can hold rather than tying the grid to R
+    const int gran = 4 * (NUM_THREADS / 32);
+    int chunks_c = std::max(1, std::min((D + gran - 1) / gran, 512));
+    int chunk_cols = ((D / chunks_c + gran - 1) / gran) * gran;
+    int n_chunks = (D + chunk_cols - 1) / chunk_cols;
+    dim3 grid_c(n_chunks);
+    int smem = RMAX * LR * sizeof(float);
+    if (half_out)
+        gr_finalize_rows_kernel<4, RMAX, true><<<grid_c, NUM_THREADS, smem, stream>>>
+            (streams, dots, upt, w, post, mixed, R, D, LR, chunk_cols, rms_eps);
+    else
+        gr_finalize_rows_kernel<4, RMAX, false><<<grid_c, NUM_THREADS, smem, stream>>>
+            (streams, dots, upt, w, post, mixed, R, D, LR, chunk_cols, rms_eps);
+    cuda_check(cudaPeekAtLastError());
+}
+
+#endif // USE_ROCM
+
 // Shared launch logic. mode: fn rows M = 2H + H^2 (mix) or H (head)
 
 bool hc_mix_supported(int device)
@@ -944,6 +1275,22 @@ void gr_mix
 
     const at::cuda::OptionalCUDAGuard device_guard(device);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+#if defined(USE_ROCM)
+    if (gr_mix_rows_enabled() && R <= 4 && D % 256 == 0 && D <= 256 * GR_ROWS_FN_MAX)
+    {
+        float* post_p = post ? (float*) post.value().data_ptr() : nullptr;
+        const bool half_out = mixed.dtype() == at::kHalf;
+        #define GR_ROWS_ARGS \
+            (const float*) streams.data_ptr(), (const half*) fn.data_ptr(), (const half*) upt.data_ptr(), \
+            (const half*) w.data_ptr(), (float*) dots.data_ptr(), post_p, mixed.data_ptr(), half_out, \
+            R, M, D, LR, (float) rms_eps, stream
+        if (R <= 1)      gr_mix_rows_launch<1>(GR_ROWS_ARGS);
+        else if (R <= 2) gr_mix_rows_launch<2>(GR_ROWS_ARGS);
+        else             gr_mix_rows_launch<4>(GR_ROWS_ARGS);
+        #undef GR_ROWS_ARGS
+        return;
+    }
+#endif
     dim3 grid_a(M + 1, R);
     gr_dots_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
     (
