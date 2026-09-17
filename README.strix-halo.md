@@ -52,8 +52,13 @@ Six-prompt greedy means, 512 tokens (`prompt_sweep.py`). PPL 4.225935 unchanged 
 row. Per-round phase split (`phase_prof.py`): trunk verify forward 85–88 %, MTP head 10–12 %,
 host ≈ 1 % — decode is bytes-per-forward bound. Byte budget per trunk forward after int8
 mixers (`bytes_by_module.py`): routed experts 47 %, dense EXL3 GEMVs 40 %, mixers 13 %.
-The grouped-MoE prefill kernel streams its experts at ~55–75 GB/s against a ~135 GB/s
-practical single-kernel rate on this part and is the remaining lever.
+Every bulk kernel is now at this part's practical single-kernel streaming rate (~135 GB/s,
+`read_bw_vs_size.py`): grouped-MoE prefill GEMV 131–135 GB/s on unique-expert bytes, lm_head
+~200 GB/s, dense GEMVs 55–65 % of the 236 GB/s DRAM peak. The verify forward as a whole runs
+at ~95 GB/s effective — the remaining ~16 ms per round is spread across ~1,300 launches per
+forward (dispatch + tail effects), not concentrated in any one kernel. `EXL3_BLOCK_GRAPH`
+(graph replay) measured neutral under MTP. 50 tok/s would need round ≤ 50.6 ms at 2.5
+tok/round, i.e. verify ≤ 43 ms vs 55 measured; kernel-level work is exhausted on gfx1151.
 
 PPL 4.2259, identical across all configs. Roofline 236 GB/s.
 
