@@ -25,8 +25,11 @@ def _require_gfx12():
     if not _roc_available():
         raise SystemExit("ROCm build / device not available")
     arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    if arch.split(":", 1)[0] not in ("gfx1200", "gfx1201"):
-        raise SystemExit(f"HIP GEMV oracle requires gfx1200/gfx1201, got {arch or 'unknown'}")
+    # gfx12 (RDNA4) and gfx11.5 (RDNA3.5 / Strix Halo) both have a WMMA GEMV.
+    # Ask the extension rather than hardcoding an arch allowlist.
+    _wmma_archs = ("gfx1200", "gfx1201", "gfx1150", "gfx1151", "gfx1152")
+    if arch.split(":", 1)[0] not in _wmma_archs:
+        raise SystemExit(f"HIP GEMV oracle requires a WMMA arch {_wmma_archs}, got {arch or 'unknown'}")
     assert hasattr(ext, "exl3_gemv"), \
         "gfx12 target build is missing the required ext.exl3_gemv binding"
     assert hasattr(ext, "exl3_gemv_supported"), \

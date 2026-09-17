@@ -36,20 +36,40 @@ Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch 
 | + `EXL3_HIP_PREFILL_MIN_ROWS=2`, `-ndt 2 -dds` | **32.7 mean / 38.7 peak** |
 | + int8 GEMV (`EXL3_INT8_GEMV=2`) | 31.7–31.9 (noise) |
 | + CPU offload `-mcs 16/64/128` | 29.7 / 28.2 / 27.0 (loss) |
+| + `EXL3_HIP_STG_PAD` (LDS bank conflict fix) | **34.9 mean / 41.1 peak** |
 
 PPL 4.2259, identical across all configs. Roofline 236 GB/s.
 
-**m=3 GEMV kernel** (25 % of decode wall, ~30 % of roofline): counter profile shows 36 % VALU
+**m=3 GEMV kernel** (25 % of decode wall, ~30 % of roofline): counter profile showed 36 % VALU
 issue, 17 % LDS, 144 GB/s — stall-bound, not issue- or bandwidth-bound. The three loop-structure
 variants (B-prefetch-after-stage, DOT4 decode, A-fragment prefetch ring) are all within ±2 % of
 baseline; A-ring is slightly negative (VGPR pressure). The per-slice `s_waitcnt vmcnt(0)` is
-**not** the bottleneck. Next candidates need `SQ_LDS_BANK_CONFLICT` / WMMA-issue counters.
+**not** the bottleneck.
+
+**RESOLVED by `EXL3_HIP_STG_PAD`** (+10 % mean decode). The stall was an LDS bank conflict in
+the WMMA staging buffer, findable by arithmetic rather than counters. `hip_mma_stg` was
+`[warps][32][4]` of `__half2`; `__half2` is one dword and RDNA LDS has 32 banks of one dword
+(`bank = dword_addr % 32`), so the innermost extent *is* the per-lane bank stride, and 4 divides 32:
+
+| access | banks | conflict |
+|---|---|---|
+| `stg[lane][slot]`, lane 0..31 | `lane*4 % 32` → 8 banks | 4-way |
+| `stg[4*(R&7)+j][s]`, R = lane&15 | `4*(R&7)*4 % 32` → {0,16} | **8-way** |
+
+Padding the extent to 5 (`gcd(5,32)=1`) spreads stores over all 32 banks and cuts loads to 2-way.
+PPL and draft acceptance unchanged, so the gain is kernel time. Any `__shared__` array of
+one-dword elements here needs an innermost extent coprime with 32.
+
+**Do not shrink `HIP_MMA_STG_WARPS`** to match `EXL3_MOE_CFG=2`'s 4 warps: the non-MoE GEMV paths
+still launch 16 warps and index this buffer by warp id, so a 4-warp buffer gives NaN logits —
+and `eval/ppl.py` still reports the correct 4.2259 on that broken build. Only `bench_mtp.py`
+catches it.
 
 ## Build
 
 ```bash
 source tools/strix_halo/env.sh build            # SDK toolchain from .venv-gfx1151
-EXL3_HIP_DEFINES="" pip install -e . --no-build-isolation --no-deps
+EXL3_HIP_DEFINES="EXL3_HIP_STG_PAD" pip install -e . --no-build-isolation --no-deps
 source tools/strix_halo/env.sh                  # runtime env (LD_PRELOAD Ubuntu HSA)
 python tools/strix_halo/bench_mtp.py -n 128 -ndt 2 -dds -g
 ```
