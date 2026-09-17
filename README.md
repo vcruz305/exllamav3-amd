@@ -1,3 +1,23 @@
+> ## 🟥 AMD fork — adds RDNA 3.5 (gfx1151 / Strix Halo) support
+>
+> **This branch adds AMD GPU functionality that is not in upstream ExLlamaV3.** Upstream targets
+> CUDA; the [`sdougbrown/exllamav3`](https://github.com/sdougbrown/exllamav3) base this is built on
+> adds a ROCm/HIP decode path for **gfx12 (RDNA 4)** only. This branch extends that path to
+> **gfx11.5 (RDNA 3.5)** — the Ryzen AI Max+ 395 / Radeon 8060S iGPU in the Framework Desktop.
+>
+> **What's added for AMD:** RDNA3.5 WMMA GEMV kernel (oracle-verified fragment layout), grouped-MoE
+> and fused-router paths enabled for gfx11.5, an int8-activation GEMV HIP port (`cp.async` → register
+> staging), `v_sad_u8` trellis decode, a CPU expert-offload port, and an LDS bank-conflict fix in the
+> WMMA staging buffer.
+>
+> **Measured** on Qwen3.8-Flash-Next-EXL3 (3.05 bpw) on one gfx1151: decode **4.27 → 34.9 tok/s mean**
+> (41.1 peak), perplexity unchanged at 4.2259.
+>
+> 👉 **See [`README.strix-halo.md`](README.strix-halo.md)** for the AMD build instructions, env knobs,
+> benchmark harnesses and measured results. The Installation section below is upstream's and is
+> **CUDA-specific** — do not follow it for AMD.
+>
+> NVIDIA/CUDA code paths are untouched; everything here is behind `USE_ROCM` / arch guards.
 
 <p align="center">
   <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">

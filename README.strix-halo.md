@@ -1,7 +1,14 @@
 # exllamav3 on AMD Strix Halo (gfx1151)
 
-Private working tree for running exllamav3 on the AMD Ryzen AI Max+ 395 / Radeon 8060S
+> **This tree adds AMD GPU functionality to ExLlamaV3 that upstream does not have.** Upstream is
+> CUDA-only; the `sdougbrown/exllamav3` base adds a ROCm/HIP decode path for **gfx12 (RDNA 4)**
+> only. Everything here extends that to **gfx11.5 (RDNA 3.5)** and tunes it for a 20-CU iGPU on
+> unified memory. NVIDIA/CUDA paths are untouched — all changes sit behind `USE_ROCM` / arch guards.
+
+Working tree for running exllamav3 on the AMD Ryzen AI Max+ 395 / Radeon 8060S
 (RDNA 3.5, gfx1151, wave32, 128 GB unified memory) — the Framework Desktop.
+
+Primary repo: GitHub `vcruz305/exllamav3-amd`.
 
 Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch `integration`
 (gfx12 WMMA path) at `991f1a0`. Everything on top of that is in the commits after it.
