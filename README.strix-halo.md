@@ -56,13 +56,75 @@ host ≈ 1 % — decode is bytes-per-forward bound. Byte budget per trunk forwar
 mixers (`bytes_by_module.py`): routed experts 47 %, dense EXL3 GEMVs 40 %, mixers 13 %.
 Every bulk kernel is now at this part's practical single-kernel streaming rate (~135 GB/s,
 `read_bw_vs_size.py`): grouped-MoE prefill GEMV 131–135 GB/s on unique-expert bytes, lm_head
-~200 GB/s, dense GEMVs 55–65 % of the 236 GB/s DRAM peak. The verify forward as a whole runs
-at ~95 GB/s effective — the remaining ~16 ms per round is spread across ~1,300 launches per
-forward (dispatch + tail effects), not concentrated in any one kernel. `EXL3_BLOCK_GRAPH`
-(graph replay) measured neutral under MTP. 50 tok/s would need round ≤ 50.6 ms at 2.5
-tok/round, i.e. verify ≤ 43 ms vs 55 measured; kernel-level work is exhausted on gfx1151.
+~200 GB/s, dense GEMVs 55–65 % of the 236 GB/s DRAM peak. `EXL3_BLOCK_GRAPH` (graph replay)
+measured neutral under MTP, and stays neutral at 16 and 64 slots (the old 4-slot default was
+not the limiter: 44.51 / 44.47 vs 44.72 off, bit-identical output).
 
 PPL 4.2259, identical across all configs. Roofline 236 GB/s.
+
+### Cost of verify width — and why single-stream stops near 47
+
+`width_ndt_batch.sh` sweeps `-ndt` (static) and derives ms-per-forward as
+`wall / (tokens − accepted)`. At `-ndt k` the verify forward carries k+1 rows:
+
+| cfg | rows | ms/fwd | tok/fwd | tok/s |
+|---|---|---|---|---|
+| no MTP | 1 | 40.6 | 1.00 | 24.6 |
+| ndt=1 | 2 | 51.5 | 1.94 | 37.6 |
+| **ndt=2** | **3** | **59.1** | **2.75** | **47.3** |
+| ndt=3 | 4 | 69.0 | 3.05 | 44.1 |
+| ndt=4 | 5 | 77.9 | 3.44 | 44.1 |
+| ndt=5 | 6 | 86.1 | 3.39 | 39.4 |
+
+Linear fit: **ms/forward = 32.4 + 9.04 × rows.** Two consequences, both of which correct
+earlier analysis in this file:
+
+- **Extra verify rows are not free.** Only 47 % of a 4-row forward is row-independent; each
+  added row costs 9.0 ms because routed-expert bytes scale with row count (more positions →
+  more *unique* experts of 512 touched). So **tree / wide speculation is a dead end here**: a
+  16-row tree costs 177 ms and would need ~7.8 accepted tokens per forward just to match
+  today's 44 tok/s. No drafter delivers that, and MTP acceptance already decays to 47.8 % at
+  depth 5.
+- **Static `-ndt 2` is the single-stream optimum on a favourable prompt** (47.3 / 47.0
+  measured twice, 87.6 % acceptance) — better than the `-ndt 3 -dds -dc 0.6` production point
+  (44.1–44.7). Re-sweep the six-prompt mean before changing a default; dynamic drafting still
+  wins on the hard prompts it was tuned for.
+
+An earlier claim here that the verify forward runs "at ~95 GB/s effective, remaining gap
+spread across ~1,300 launches" was arithmetically wrong: it is **78 GB/s** (4.9 GiB / 67 ms),
+and 60 tok/s single-stream at 3.05 tok/fwd would need 107 GB/s — *below* the 135 GB/s
+single-kernel roof, so bandwidth alone never excluded it. What actually excludes it is the
+9.04 ms marginal row cost plus acceptance decay: the two trade against each other and the
+product peaks at ~47.
+
+### Aggregate throughput: 60+ tok/s is available today via batching
+
+Because 32.4 ms of every forward is row-independent, **concurrent sequences share it**.
+`batch_throughput.py` (continuous batching, MTP on, ndt=2, greedy, 512 tokens/seq):
+
+| batch | tok/s per seq | **aggregate tok/s** | acceptance | GiB |
+|---|---|---|---|---|
+| 1 | 47.0 | 47.0 | 87.6 % | 54.3 |
+| 3 | 23.4 | **70.3** | 86.9 % | 54.3 |
+| 4 | 19.9 | **79.4** | 84.2 % | 54.3 |
+| 5 | 17.2 | **86.1** | 83.2 % | 54.3 |
+
+The `32.4 + 9.04 × rows` model predicts these within 6–10 % for batch ≤ 4 (it over-predicts
+above that: per-sequence attention and page-table work grow with concurrency, which a
+row-only fit does not capture). Memory is flat — the cache is the only per-sequence cost, so
+a 16 k context per stream is affordable at these batch sizes.
+
+**So: single stream is latency-limited at ~47 tok/s, but the GPU has ~1.8× more throughput
+available and batching is how you collect it.** For a chat UI serving one person the 47
+number is the one that matters; for an agent fan-out, a batch queue, or any multi-request
+endpoint, 70–86 tok/s is real and needs no kernel work. `-cq 4` is what makes several long
+contexts fit concurrently.
+
+Rejected as speed levers (measured, not assumed): **2.05 bpw pack** — 25.7 tok/s at ndt=3
+(vs 44.1 at 3.05 bpw) despite 79 % acceptance; K=2 trellis tiles this part badly, so lower
+bits go the wrong way. **fp32-out-via-fp16 at decode row counts** (`MIN_ROWS=1`) — 44.0 vs
+44.8; that fix only pays at prefill widths.
+
 
 **m=3 GEMV kernel** (25 % of decode wall, ~30 % of roofline): counter profile showed 36 % VALU
 issue, 17 % LDS, 144 GB/s — stall-bound, not issue- or bandwidth-bound. The three loop-structure
