@@ -100,7 +100,8 @@ product peaks at ~47.
 ### Aggregate throughput: 60+ tok/s is available today via batching
 
 Because 32.4 ms of every forward is row-independent, **concurrent sequences share it**.
-`batch_throughput.py` (continuous batching, MTP on, ndt=2, greedy, 512 tokens/seq):
+`batch_throughput.py` (synthetic best case: fp16 cache, raw prompts, no stop conditions, all
+sequences the same length so the batch never drains; ndt=2, greedy, 512 tokens/seq):
 
 | batch | tok/s per seq | **aggregate tok/s** | acceptance | GiB |
 |---|---|---|---|---|
@@ -114,11 +115,58 @@ above that: per-sequence attention and page-table work grow with concurrency, wh
 row-only fit does not capture). Memory is flat — the cache is the only per-sequence cost, so
 a 16 k context per stream is affordable at these batch sizes.
 
-**So: single stream is latency-limited at ~47 tok/s, but the GPU has ~1.8× more throughput
+**Realistic sustained numbers** (the recipe's `batch.sh`: 16-prompt queue so the batch stays
+full, qwen35 chat template, stop conditions, Q4 cache, greedy, 512 max tokens):
+
+| batch | rows | aggregate tok/s |
+|---|---|---|
+| 1 | 3 | 34.2 |
+| 4 | 12 | 66.1 |
+| **5** | **15** | **74.0 / 75.1** (two runs) |
+| 6 | 18 | **56.1** ⚠ |
+| 8 | 24 | 68.0 |
+| 10 | 30 | 72.7 |
+| 11 | 33 | 70.2 |
+
+Two operational rules fall out of that table:
+
+- **The 16-row rule.** `MOE_PREFILL_ROWS_PER_CHUNK = 16`: the grouped-MoE kernel processes
+  expert rows in chunks of 16, and a batch of B sequences at `-ndt K` submits `B*(K+1)` rows
+  in one forward. Choose B so `B*(K+1)` lands on or just under a multiple of 16. At ndt=2
+  (3 rows/seq) **batch 5 = 15 rows = one full chunk is the peak, and batch 6 = 18 rows costs
+  24 %** — a full chunk plus a nearly-empty second one. Predicted from the constant, then
+  confirmed; the same dip appears in the synthetic sweep (batch 6 = 59.2 between 4 = 79.4 and
+  8 = 69.4), so it is the kernel granularity and not noise. Batch 11 (33 rows) dips mildly
+  for the same reason.
+- **Queue deeper than batch.** Aggregate throughput needs the batch kept full. Four prompts
+  at `-b 4` drains as sequences finish and yields ~51 tok/s; sixteen prompts at `-b 5`
+  sustains 74–75.
+
+**So: single stream is latency-limited at ~47 tok/s, but the GPU has ~2.2× more throughput
 available and batching is how you collect it.** For a chat UI serving one person the 47
 number is the one that matters; for an agent fan-out, a batch queue, or any multi-request
-endpoint, 70–86 tok/s is real and needs no kernel work. `-cq 4` is what makes several long
+endpoint, 74 tok/s is real and needs no kernel work. `-cq 4` is what makes several long
 contexts fit concurrently.
+
+### Static vs dynamic draft sizing: not resolvable, keep the default
+
+A single favourable prompt made static `-ndt 2` look like a 6 % win (47.3 vs 44.7). On the
+six-prompt distribution it is not, and that gap was the cherry-pick this file warns about.
+`prompt_sweep.py` now takes `NDT` / `DC` / `DDS`; `ndt_sweep_batch.sh` runs the four corners:
+
+| config | reps | mean of means | six-prompt min |
+|---|---|---|---|
+| ndt=3 dynamic dc=0.6 (**production default**) | 3 | 42.25 | 38.00 |
+| ndt=3 static | 3 | 42.53 | 38.59 |
+| ndt=2 dynamic dc=0.4 | 1 | 41.14 | 35.44 |
+| ndt=2 static | 1 | 40.09 | 34.64 |
+
+Static ndt=3 is +0.28 tok/s over the default, but run-to-run drift *within* the default
+config is 1.30 tok/s — the effect is 0.22× the noise, so it is **not resolvable** and the
+default stands. `-ndt 2` static is genuinely worse (−2.2 mean, −3.4 on the worst prompt).
+Methodological note for future A/Bs here: the six-prompt mean drifts >1 tok/s between
+identical runs, so any claim under ~2 tok/s needs repeats before it means anything.
+
 
 Rejected as speed levers (measured, not assumed): **2.05 bpw pack** — 25.7 tok/s at ndt=3
 (vs 44.1 at 3.05 bpw) despite 79 % acceptance; K=2 trellis tiles this part badly, so lower
