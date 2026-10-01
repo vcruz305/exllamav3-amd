@@ -438,6 +438,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.is_quantized = False
         self.support_fused = False
         self.support_quant_paths = False
+        self.uniform_expert_q = True     # experts share one (K, mcg, mul1); set in load_local
         self.multi_gate = None
         self.multi_up = None
         self.multi_down = None
@@ -576,13 +577,24 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             print(f" !! Warning, partially quantized block-sparse MLP layer: {self.key}")
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
+        # Mixed-K: skip MultiLinear/fused when experts differ in (K, mcg, mul1). MultiLinear
+        # asserts a single uniform K (multilinear.py), and the gfx1151 grouped kernels are
+        # hard-wired to K == 3 (support_hip_grouped below), so a mixed-K layer must take the
+        # dense per-expert path, which already dispatches each expert at its own bitrate
+        def _uniform_q(ls):
+            return not ls or len({(l.inner.K, l.inner.mcg, l.inner.mul1) for l in ls}) <= 1
+        self.uniform_expert_q = self.is_quantized and all(
+            _uniform_q(ls) for ls in ((self.gates if self.gated else []), self.ups, self.downs))
+        if self.is_quantized and not self.uniform_expert_q:
+            print(f" -- Mixed-K experts in {self.key}: dense per-expert path")
+
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
         has_mgemm = hasattr(ext, "exl3_mgemm")
         self.support_quant_paths = (
-            has_mgemm and self.is_quantized and
+            has_mgemm and self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
@@ -596,7 +608,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bszn = (
-            has_mgemm and self.is_quantized and
+            has_mgemm and self.is_quantized and self.uniform_expert_q and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
@@ -643,7 +655,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # fusion) still need an explicit family-1 / arch-string test.
             hip_grouped_device = ext.exl3_gemv_supported(device_index)
         self.support_hip_grouped = (
-            hip_grouped_device and self.is_quantized and self.gated and self.activation_fn == "silu" and
+            hip_grouped_device and self.is_quantized and self.uniform_expert_q and
+            self.gated and self.activation_fn == "silu" and
             self.hidden_size == 2560 and self.intermediate_size_padded in (640, 768) and
             self.num_experts_per_tok == 10 and self.interm_dtype == torch.half and
             self.act_limit == 0 and self.tp_mode is None and not self.hip_grouped_lora_blocked and
