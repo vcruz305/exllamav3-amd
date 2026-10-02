@@ -99,6 +99,36 @@ The remaining gap is bytes, not dispatch.
     AGENTS.md predates that knob (commit fa32aaa); this change moves neither number.
 - Generated text is coherent with the reasoning block intact; MTP acceptance 74 % (six-prompt).
 
+## Concurrency and context
+
+Concurrency (`batch_throughput.py`, ndt=2, greedy, 512 tok/seq, fp16 cache 16384):
+
+| batch | flat-K aggregate tok/s | mixed-K aggregate tok/s |
+|---|---|---|
+| 1 | 48.9 | 41.5 |
+| 3 | 74.0 | 61.8 |
+| 4 | 81.3 | 70.8 |
+| **5** | **90.0** | **78.1** |
+| 6 | 63.5 | 64.1 |
+| 8 | 74.3 | 73.5 |
+
+Mixed-K holds 85-87 % of flat-K through batch 5 and follows the same 16-row rule (batch 5 at
+ndt=2 = 15 rows = one prefill chunk). Memory is flat in batch: 66.6 GiB vs 54.3 GiB.
+
+Context (`ctx_sweep.py`, cold random-id prompt filling the cache, 128 decode tokens):
+
+| pack / cache | loaded | prompt | prefill tok/s | TTFT | decode tok/s |
+|---|---|---|---|---|---|
+| flat fp16 131072 | 59.2 GiB | 130,933 | 401 | 326 s | 42.4 |
+| mixed fp16 131072 | 71.5 GiB | 130,933 | 402 | 326 s | 27.7 |
+| flat q4 262144 | 58.3 GiB | 262,005 | 408 | 643 s | 32.3 |
+| mixed q4 262144 | 70.6 GiB | 262,005 | 408 | 642 s | 30.8 |
+
+The full 262,144-token context (`max_position_embeddings`) works on the mixed-K pack. The
+cache is one page pool shared by all sequences, not a per-stream allocation; each sequence is
+capped at 262,144 by position embeddings. Prefill is ~400 tok/s on both packs at every depth,
+which is the next thing to fix: it is the same rate with or without mixed K.
+
 ## Knobs
 
 - `EXL3_HIP_MOE_MK=0` disables the mixed-K grouped route (dense per-expert loop).

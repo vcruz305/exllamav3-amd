@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.expanduser("~/exllamav3-amd"))
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
 from exllamav3.generator.sampler import GreedySampler
 
-MODEL = os.path.expanduser("~/models/Qwen3.8-Flash-Next-EXL3")
+MODEL = os.path.expanduser(os.environ.get("MODEL", "~/models/Qwen3.8-Flash-Next-EXL3"))
 CS = int(os.environ.get("CS", "65536"))
 PROMPTS = [int(x) for x in os.environ.get("PROMPTS", "1024,8192,32768").split(",")]
 NTOK = int(os.environ.get("NTOK", "128"))
