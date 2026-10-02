@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ATen/Tensor.h>
+#include <vector>
 #include <cuda_runtime.h>
 
 // QTIP-style small-m GEMV path (see exl3_gemv_kernel.cuh). Launched from exl3_gemm when the
@@ -56,6 +57,68 @@ void exl3_moe_gfx12_k3_prefill
     const at::Tensor& down_trellis,
     const at::Tensor& down_suh,
     const at::Tensor& down_svh,
+    at::Tensor& gu_had,
+    at::Tensor& gu_out,
+    at::Tensor& down_out,
+    at::Tensor& expert_offsets,
+    at::Tensor& inverse_order,
+    at::Tensor& expert_chunks,
+    at::Tensor& chunk_count
+);
+
+// Mixed-K counterparts of the two entry points above: per-expert bitrates (3..7) via device
+// int32[E] K tables per projection, plus the host-known set of bitrates present per projection
+// (one GEMV launch per bitrate; blocks skip slots whose expert is at a different K).
+void exl3_moe_mk
+(
+    const at::Tensor& A,
+    at::Tensor& output,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& gate_trellis,
+    const at::Tensor& gate_suh,
+    const at::Tensor& gate_svh,
+    const at::Tensor& up_trellis,
+    const at::Tensor& up_suh,
+    const at::Tensor& up_svh,
+    const at::Tensor& down_trellis,
+    const at::Tensor& down_suh,
+    const at::Tensor& down_svh,
+    const at::Tensor& gate_K,
+    const at::Tensor& up_K,
+    const at::Tensor& down_K,
+    const std::vector<int64_t>& gate_ks,
+    const std::vector<int64_t>& up_ks,
+    const std::vector<int64_t>& down_ks,
+    at::Tensor& gu_had,
+    at::Tensor& gu_out,
+    at::Tensor& down_had,
+    at::Tensor& down_out
+);
+
+void exl3_moe_mk_prefill
+(
+    const at::Tensor& A,
+    at::Tensor& output,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& order,
+    const at::Tensor& expert_count,
+    const at::Tensor& gate_trellis,
+    const at::Tensor& gate_suh,
+    const at::Tensor& gate_svh,
+    const at::Tensor& up_trellis,
+    const at::Tensor& up_suh,
+    const at::Tensor& up_svh,
+    const at::Tensor& down_trellis,
+    const at::Tensor& down_suh,
+    const at::Tensor& down_svh,
+    const at::Tensor& gate_K,
+    const at::Tensor& up_K,
+    const at::Tensor& down_K,
+    const std::vector<int64_t>& gate_ks,
+    const std::vector<int64_t>& up_ks,
+    const std::vector<int64_t>& down_ks,
     at::Tensor& gu_had,
     at::Tensor& gu_out,
     at::Tensor& down_out,

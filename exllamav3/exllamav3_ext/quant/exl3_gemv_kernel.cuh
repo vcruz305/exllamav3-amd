@@ -210,8 +210,10 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #endif
 {
 #if defined(USE_ROCM) || defined(__HIPCC__)
-    static_assert(bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6,
-                  "HIP exl3_gemv_kernel supports 2, 3, 4, 5 and 6 bpw");
+    // 7 and 8 bpw decode through dq_dispatch from the staged tile, like 5 and 6 (high-bitrate
+    // packs quantize attention / shared experts / lm_head at 8 bpw)
+    static_assert(bits >= 2 && bits <= 8,
+                  "HIP exl3_gemv_kernel supports 2 through 8 bpw");
 #else
     static_assert(bits == 2 || bits == 3 || bits == 4,
                   "CUDA exl3_gemv_kernel supports 2, 3 and 4 bpw");
@@ -245,7 +247,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
 #if defined(USE_ROCM) || defined(__HIPCC__)
     constexpr int LSTRIDE = bits == 3 ? 24 : 32;            // uint32 per lane-wide load
     constexpr int LOADS = bits == 2 ? WNT / 2 :
-                          bits == 5 ? (WNT * TWORDS + LSTRIDE - 1) / LSTRIDE :
+                          (bits == 5 || bits == 7 || bits == 8) ? (WNT * TWORDS + LSTRIDE - 1) / LSTRIDE :
                           bits == 6 ? WNT * 3 / 2 : WNT;
     static_assert((bits != 2 && bits != 6) || WNT % 2 == 0,
                   "2 bpw and 6 bpw lane-wide loads require an even tile count");
@@ -504,7 +506,7 @@ void exl3_gemv_kernel(EXL3_GEMM_ARGS)
                 FragB f0, f1;
 #if defined(USE_ROCM) || defined(__HIPCC__)
                 const uint32_t* tp = &sh_stage[warp][t * TWORDS];
-                if constexpr (bits == 5 || bits == 6)
+                if constexpr (bits >= 5)
                     dq_dispatch<bits, cb>(tp, lane * 8, f0, f1);
                 else if constexpr (bits == 4)
                     exl3_gemv_ns::dq8_regs_4bits<cb>(tp[(lane + 31) & 31], tp[lane], f0, f1);

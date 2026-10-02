@@ -8,6 +8,7 @@
 #include "hadamard.cuh"
 #if defined(USE_ROCM)
 #include "exl3_gemv_int8.cuh"   // fused int8-activation GEMV (mul1 tensors, m <= 2), opt-in via EXL3_INT8_GEMV
+#include "exl3_gemv_moe_mk.cuh" // mixed-K grouped MoE GEMV launchers (one TU per bitrate)
 #endif
 
 #include <c10/cuda/CUDAGuard.h>
@@ -895,6 +896,398 @@ void exl3_moe_gfx12_k3_prefill
     cuda_check(hipPeekAtLastError());
 }
 
+// ---------------------------------------------------------------------------------------------
+// Mixed-K grouped MoE (decode and prefill). Same stage sequence and helper kernels as
+// exl3_moe_gfx12_k3 / _prefill above; only the two GEMV stages differ: each is issued once per
+// bitrate present in the layer (*_ks, host-known from load time) and every block checks its
+// expert's K against the launch's compiled K (*_K tables, device int32[E]).
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+void check_k_table(const at::Tensor& t, int64_t experts, const at::Device& device, const char* name)
+{
+    TORCH_CHECK(t.device() == device && t.is_contiguous() && t.dtype() == at::kInt &&
+                t.dim() == 1 && t.numel() == experts, name, " must be contiguous device int32[E]");
+}
+
+void check_ks(const std::vector<int64_t>& ks, const char* name)
+{
+    TORCH_CHECK(!ks.empty(), name, " must list at least one bitrate");
+    for (int64_t k : ks)
+        TORCH_CHECK(k >= EXL3_MOE_MK_MIN_BITS && k <= EXL3_MOE_MK_MAX_BITS,
+                    name, ": unsupported expert bitrate ", k, " (mixed-K grouped path covers 3..7)");
+}
+
+std::vector<int64_t> union_ks(const std::vector<int64_t>& a, const std::vector<int64_t>& b)
+{
+    std::vector<int64_t> u(a);
+    for (int64_t k : b) if (std::find(u.begin(), u.end(), k) == u.end()) u.push_back(k);
+    std::sort(u.begin(), u.end());
+    return u;
+}
+
+void run_mk_stage(const std::vector<int64_t>& ks, MoeMkGemvArgs args, bool prefill, bool two,
+                  int cfg, dim3 grid, hipStream_t stream)
+{
+    for (size_t i = 0; i < ks.size(); ++i)
+    {
+        args.zero_owner = i == 0;
+        exl3_moe_mk_gemv((int) ks[i], args, prefill, two, cfg, grid, stream);
+    }
+}
+
+} // namespace
+
+void exl3_moe_mk
+(
+    const at::Tensor& A,
+    at::Tensor& output,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& gate_trellis,
+    const at::Tensor& gate_suh,
+    const at::Tensor& gate_svh,
+    const at::Tensor& up_trellis,
+    const at::Tensor& up_suh,
+    const at::Tensor& up_svh,
+    const at::Tensor& down_trellis,
+    const at::Tensor& down_suh,
+    const at::Tensor& down_svh,
+    const at::Tensor& gate_K,
+    const at::Tensor& up_K,
+    const at::Tensor& down_K,
+    const std::vector<int64_t>& gate_ks,
+    const std::vector<int64_t>& up_ks,
+    const std::vector<int64_t>& down_ks,
+    at::Tensor& gu_had,
+    at::Tensor& gu_out,
+    at::Tensor& down_had,
+    at::Tensor& down_out
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int device;
+    cuda_check(hipGetDevice(&device));
+    TORCH_CHECK(exl3_gemv_wmma_family(device) != 0,
+                "exl3_moe_mk requires a WMMA GEMV arch (gfx1200/1201 or gfx1150/1151/1152)");
+
+    TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
+                A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
+                A.size(0) >= 1 && A.size(0) <= MOE_MAX_ROWS,
+                "exl3_moe_mk requires contiguous fp16[R, 2560], R=1..16");
+    const int rows = A.size(0);
+    const int assignments = rows * MOE_TOP_K;
+    TORCH_CHECK(output.device() == A.device() && output.is_contiguous() && output.dtype() == at::kFloat &&
+                output.dim() == 2 && output.size(0) == rows && output.size(1) == MOE_HIDDEN,
+                "exl3_moe_mk output must be contiguous fp32[R, 2560]");
+    TORCH_CHECK(selected.device() == A.device() && selected.is_contiguous() && selected.dtype() == at::kLong &&
+                selected.dim() == 2 && selected.size(0) == rows && selected.size(1) == MOE_TOP_K,
+                "exl3_moe_mk selected must be contiguous device int64[R, 10]");
+    TORCH_CHECK(weights.device() == A.device() && weights.is_contiguous() && weights.dtype() == at::kHalf &&
+                weights.sizes() == selected.sizes(),
+                "exl3_moe_mk weights must be contiguous device fp16[R, 10]");
+
+    const int64_t experts = gate_trellis.numel();
+    TORCH_CHECK(experts > 0, "exl3_moe_mk requires nonempty expert tables");
+    check_ptr_table(gate_trellis, experts, A.device(), "gate_trellis");
+    check_ptr_table(gate_suh, experts, A.device(), "gate_suh");
+    check_ptr_table(gate_svh, experts, A.device(), "gate_svh");
+    check_ptr_table(up_trellis, experts, A.device(), "up_trellis");
+    check_ptr_table(up_suh, experts, A.device(), "up_suh");
+    check_ptr_table(up_svh, experts, A.device(), "up_svh");
+    check_ptr_table(down_trellis, experts, A.device(), "down_trellis");
+    check_ptr_table(down_suh, experts, A.device(), "down_suh");
+    check_ptr_table(down_svh, experts, A.device(), "down_svh");
+    check_k_table(gate_K, experts, A.device(), "gate_K");
+    check_k_table(up_K, experts, A.device(), "up_K");
+    check_k_table(down_K, experts, A.device(), "down_K");
+    check_ks(gate_ks, "gate_ks");
+    check_ks(up_ks, "up_ks");
+    check_ks(down_ks, "down_ks");
+
+    TORCH_CHECK(down_had.numel() % assignments == 0, "down_had has the wrong shape");
+    const int intermediate = down_had.numel() / assignments;
+    TORCH_CHECK(intermediate == 640 || intermediate == 768,
+                "exl3_moe_mk intermediate width must be 640 or 768");
+    TORCH_CHECK(gu_had.device() == A.device() && gu_had.is_contiguous() && gu_had.dtype() == at::kHalf &&
+                gu_had.numel() == 2 * assignments * MOE_HIDDEN, "gu_had has the wrong shape");
+    TORCH_CHECK(gu_out.device() == A.device() && gu_out.is_contiguous() && gu_out.dtype() == at::kHalf &&
+                gu_out.numel() == 2 * assignments * intermediate, "gu_out has the wrong shape");
+    TORCH_CHECK(down_had.device() == A.device() && down_had.is_contiguous() && down_had.dtype() == at::kHalf,
+                "down_had has the wrong shape");
+    TORCH_CHECK(down_out.device() == A.device() && down_out.is_contiguous() && down_out.dtype() == at::kFloat &&
+                down_out.numel() == assignments * MOE_HIDDEN, "down_out has the wrong shape");
+    check_moe_alignment(A, "A");
+    check_moe_alignment(output, "output");
+    check_moe_alignment(gu_had, "gu_had");
+    check_moe_alignment(gu_out, "gu_out");
+    check_moe_alignment(down_had, "down_had");
+    check_moe_alignment(down_out, "down_out");
+
+    const int64_t* selected_ptr = reinterpret_cast<const int64_t*>(selected.data_ptr());
+    const half* weights_ptr = reinterpret_cast<const half*>(weights.data_ptr());
+    const int64_t* gt = reinterpret_cast<const int64_t*>(gate_trellis.data_ptr());
+    const int64_t* gsuh = reinterpret_cast<const int64_t*>(gate_suh.data_ptr());
+    const int64_t* gsvh = reinterpret_cast<const int64_t*>(gate_svh.data_ptr());
+    const int64_t* ut = reinterpret_cast<const int64_t*>(up_trellis.data_ptr());
+    const int64_t* usuh = reinterpret_cast<const int64_t*>(up_suh.data_ptr());
+    const int64_t* usvh = reinterpret_cast<const int64_t*>(up_svh.data_ptr());
+    const int64_t* dt = reinterpret_cast<const int64_t*>(down_trellis.data_ptr());
+    const int64_t* dsuh = reinterpret_cast<const int64_t*>(down_suh.data_ptr());
+    const int64_t* dsvh = reinterpret_cast<const int64_t*>(down_svh.data_ptr());
+    const int* gK = reinterpret_cast<const int*>(gate_K.data_ptr());
+    const int* uK = reinterpret_cast<const int*>(up_K.data_ptr());
+    const int* dK = reinterpret_cast<const int*>(down_K.data_ptr());
+
+    const int cfg = moe_decode_cfg();
+
+    dim3 had_gu_grid(2 * assignments, MOE_HIDDEN / 128);
+    moe_had_rows_kernel<true, false><<<had_gu_grid, 32, 0, stream>>>
+    (A.data_ptr(), gu_had.data_ptr(), selected_ptr, gsuh, usuh,
+     assignments, MOE_HIDDEN, experts, true);
+
+    MoeMkGemvArgs gu = {};
+    gu.A = reinterpret_cast<const half*>(gu_had.data_ptr());
+    gu.selected = selected_ptr;
+    gu.B_table_0 = gt; gu.B_table_1 = ut;
+    gu.K_table_0 = gK; gu.K_table_1 = uK;
+    gu.C = gu_out.data_ptr();
+    gu.size_k = MOE_HIDDEN; gu.size_n = intermediate;
+    gu.experts = (int) experts; gu.assignments = assignments;
+    run_mk_stage(union_ks(gate_ks, up_ks), gu, false, true, cfg,
+                 dim3(intermediate / 32, assignments, 2), stream);
+
+    moe_had_rows_kernel<false, false><<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, gsvh, usvh,
+     assignments, intermediate, experts, false);
+
+    const int activation_count = assignments * intermediate;
+    const half* gu_ptr = reinterpret_cast<const half*>(gu_out.data_ptr());
+    moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
+    (gu_ptr, gu_ptr + activation_count, reinterpret_cast<half*>(down_had.data_ptr()), activation_count);
+
+    moe_had_rows_kernel<true, false><<<dim3(assignments, intermediate / 128), 32, 0, stream>>>
+    (down_had.data_ptr(), down_had.data_ptr(), selected_ptr, dsuh, dsuh,
+     assignments, intermediate, experts, false);
+
+    MoeMkGemvArgs dn = {};
+    dn.A = reinterpret_cast<const half*>(down_had.data_ptr());
+    dn.selected = selected_ptr;
+    dn.B_table_0 = dt; dn.B_table_1 = dt;
+    dn.K_table_0 = dK; dn.K_table_1 = dK;
+    dn.C = down_out.data_ptr();
+    dn.size_k = intermediate; dn.size_n = MOE_HIDDEN;
+    dn.experts = (int) experts; dn.assignments = assignments;
+    run_mk_stage(down_ks, dn, false, false, cfg, dim3(MOE_HIDDEN / 32, assignments, 1), stream);
+
+    moe_had_rows_kernel<false, true><<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
+    (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, dsvh, dsvh,
+     assignments, MOE_HIDDEN, experts, false);
+
+    moe_weighted_reduce_kernel<<<dim3(CEIL_DIVIDE(MOE_HIDDEN, 256), rows), 256, 0, stream>>>
+    (reinterpret_cast<const float*>(down_out.data_ptr()), selected_ptr, weights_ptr,
+     reinterpret_cast<float*>(output.data_ptr()), MOE_HIDDEN);
+    cuda_check(hipPeekAtLastError());
+}
+
+void exl3_moe_mk_prefill
+(
+    const at::Tensor& A,
+    at::Tensor& output,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& order,
+    const at::Tensor& expert_count,
+    const at::Tensor& gate_trellis,
+    const at::Tensor& gate_suh,
+    const at::Tensor& gate_svh,
+    const at::Tensor& up_trellis,
+    const at::Tensor& up_suh,
+    const at::Tensor& up_svh,
+    const at::Tensor& down_trellis,
+    const at::Tensor& down_suh,
+    const at::Tensor& down_svh,
+    const at::Tensor& gate_K,
+    const at::Tensor& up_K,
+    const at::Tensor& down_K,
+    const std::vector<int64_t>& gate_ks,
+    const std::vector<int64_t>& up_ks,
+    const std::vector<int64_t>& down_ks,
+    at::Tensor& gu_had,
+    at::Tensor& gu_out,
+    at::Tensor& down_out,
+    at::Tensor& expert_offsets,
+    at::Tensor& inverse_order,
+    at::Tensor& expert_chunks,
+    at::Tensor& chunk_count
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int device;
+    cuda_check(hipGetDevice(&device));
+    TORCH_CHECK(exl3_gemv_wmma_family(device) != 0,
+                "exl3_moe_mk_prefill requires a WMMA GEMV arch (gfx1200/1201 or gfx1150/1151/1152)");
+
+    TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
+                A.dim() == 2 && A.size(1) == MOE_HIDDEN &&
+                A.size(0) >= 2 && A.size(0) <= MOE_PREFILL_MAX_ROWS,
+                "exl3_moe_mk_prefill requires contiguous fp16[R, 2560], R=2..2048");
+    const int rows = A.size(0);
+    const int assignments = rows * MOE_TOP_K;
+    TORCH_CHECK(output.device() == A.device() && output.is_contiguous() &&
+                output.dtype() == at::kFloat && output.dim() == 2 &&
+                output.size(0) == rows && output.size(1) == MOE_HIDDEN,
+                "mk prefill output must be contiguous fp32[R, 2560]");
+    TORCH_CHECK(selected.device() == A.device() && selected.is_contiguous() &&
+                selected.dtype() == at::kLong && selected.dim() == 2 &&
+                selected.size(0) == rows && selected.size(1) == MOE_TOP_K,
+                "mk prefill selected must be contiguous device int64[R, 10]");
+    TORCH_CHECK(weights.device() == A.device() && weights.is_contiguous() &&
+                weights.dtype() == at::kHalf && weights.sizes() == selected.sizes(),
+                "mk prefill weights must be contiguous device fp16[R, 10]");
+    TORCH_CHECK(order.device() == A.device() && order.is_contiguous() &&
+                order.dtype() == at::kLong && order.dim() == 1 && order.numel() == assignments,
+                "mk prefill order must be contiguous device int64[R * 10]");
+
+    const int64_t experts = gate_trellis.numel();
+    TORCH_CHECK(experts > 0, "mk prefill requires nonempty expert tables");
+    TORCH_CHECK(expert_count.device() == A.device() && expert_count.is_contiguous() &&
+                expert_count.dtype() == at::kLong && expert_count.dim() == 1 &&
+                expert_count.numel() == experts + 1,
+                "mk prefill expert_count must be contiguous device int64[E + 1]");
+    check_ptr_table(gate_trellis, experts, A.device(), "gate_trellis");
+    check_ptr_table(gate_suh, experts, A.device(), "gate_suh");
+    check_ptr_table(gate_svh, experts, A.device(), "gate_svh");
+    check_ptr_table(up_trellis, experts, A.device(), "up_trellis");
+    check_ptr_table(up_suh, experts, A.device(), "up_suh");
+    check_ptr_table(up_svh, experts, A.device(), "up_svh");
+    check_ptr_table(down_trellis, experts, A.device(), "down_trellis");
+    check_ptr_table(down_suh, experts, A.device(), "down_suh");
+    check_ptr_table(down_svh, experts, A.device(), "down_svh");
+    check_k_table(gate_K, experts, A.device(), "gate_K");
+    check_k_table(up_K, experts, A.device(), "up_K");
+    check_k_table(down_K, experts, A.device(), "down_K");
+    check_ks(gate_ks, "gate_ks");
+    check_ks(up_ks, "up_ks");
+    check_ks(down_ks, "down_ks");
+
+    TORCH_CHECK(gu_out.numel() % (2 * assignments) == 0, "mk prefill gu_out has the wrong shape");
+    const int intermediate = gu_out.numel() / (2 * assignments);
+    TORCH_CHECK(intermediate == 640 || intermediate == 768,
+                "mk prefill intermediate width must be 640 or 768");
+    TORCH_CHECK(gu_had.device() == A.device() && gu_had.is_contiguous() && gu_had.dtype() == at::kHalf &&
+                gu_had.numel() == 2 * assignments * MOE_HIDDEN, "mk prefill gu_had has the wrong shape");
+    TORCH_CHECK(gu_out.device() == A.device() && gu_out.is_contiguous() && gu_out.dtype() == at::kHalf,
+                "mk prefill gu_out has the wrong shape");
+    TORCH_CHECK(down_out.device() == A.device() && down_out.is_contiguous() && down_out.dtype() == at::kFloat &&
+                down_out.numel() == assignments * MOE_HIDDEN, "mk prefill down_out has the wrong shape");
+    TORCH_CHECK(expert_offsets.device() == A.device() && expert_offsets.is_contiguous() &&
+                expert_offsets.dtype() == at::kLong && expert_offsets.numel() == experts + 1,
+                "mk prefill expert_offsets must be contiguous device int64[E + 1]");
+    TORCH_CHECK(inverse_order.device() == A.device() && inverse_order.is_contiguous() &&
+                inverse_order.dtype() == at::kLong && inverse_order.numel() == assignments,
+                "mk prefill inverse_order must be contiguous device int64[R * 10]");
+    TORCH_CHECK(expert_chunks.device() == A.device() && expert_chunks.is_contiguous() &&
+                expert_chunks.dtype() == at::kInt &&
+                expert_chunks.numel() >= experts * MOE_PREFILL_CHUNKS_PER_EXPERT,
+                "mk prefill expert_chunks workspace is too small");
+    TORCH_CHECK(chunk_count.device() == A.device() && chunk_count.is_contiguous() &&
+                chunk_count.dtype() == at::kInt && chunk_count.numel() == 1,
+                "mk prefill chunk_count must be a same-device int32 scalar workspace");
+    check_moe_alignment(A, "A");
+    check_moe_alignment(output, "output");
+    check_moe_alignment(gu_had, "gu_had");
+    check_moe_alignment(gu_out, "gu_out");
+    check_moe_alignment(down_out, "down_out");
+
+    const int64_t* selected_ptr = reinterpret_cast<const int64_t*>(selected.data_ptr());
+    const half* weights_ptr = reinterpret_cast<const half*>(weights.data_ptr());
+    const int64_t* order_ptr = reinterpret_cast<const int64_t*>(order.data_ptr());
+    const int64_t* counts_ptr = reinterpret_cast<const int64_t*>(expert_count.data_ptr());
+    int64_t* offsets_ptr = reinterpret_cast<int64_t*>(expert_offsets.data_ptr());
+    int64_t* inverse_ptr = reinterpret_cast<int64_t*>(inverse_order.data_ptr());
+    int* chunks_ptr = reinterpret_cast<int*>(expert_chunks.data_ptr());
+    int* chunk_count_ptr = reinterpret_cast<int*>(chunk_count.data_ptr());
+    const int64_t* gt = reinterpret_cast<const int64_t*>(gate_trellis.data_ptr());
+    const int64_t* gsuh = reinterpret_cast<const int64_t*>(gate_suh.data_ptr());
+    const int64_t* gsvh = reinterpret_cast<const int64_t*>(gate_svh.data_ptr());
+    const int64_t* ut = reinterpret_cast<const int64_t*>(up_trellis.data_ptr());
+    const int64_t* usuh = reinterpret_cast<const int64_t*>(up_suh.data_ptr());
+    const int64_t* usvh = reinterpret_cast<const int64_t*>(up_svh.data_ptr());
+    const int64_t* dt = reinterpret_cast<const int64_t*>(down_trellis.data_ptr());
+    const int64_t* dsuh = reinterpret_cast<const int64_t*>(down_suh.data_ptr());
+    const int64_t* dsvh = reinterpret_cast<const int64_t*>(down_svh.data_ptr());
+    const int* gK = reinterpret_cast<const int*>(gate_K.data_ptr());
+    const int* uK = reinterpret_cast<const int*>(up_K.data_ptr());
+    const int* dK = reinterpret_cast<const int*>(down_K.data_ptr());
+
+    cuda_check(hipMemsetAsync(inverse_ptr, 0xff, assignments * sizeof(int64_t), stream));
+    moe_prefill_metadata_kernel<<<CEIL_DIVIDE(assignments, 256), 256, 0, stream>>>
+    (counts_ptr, order_ptr, offsets_ptr, inverse_ptr, chunks_ptr, chunk_count_ptr,
+     experts, assignments);
+
+    dim3 had_gu_grid(2 * assignments, MOE_HIDDEN / 128);
+    moe_prefill_had_rows_kernel<true, false><<<had_gu_grid, 32, 0, stream>>>
+    (A.data_ptr(), gu_had.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsuh, usuh,
+     assignments, MOE_HIDDEN, experts, true);
+
+    const int chunk_slots = std::min(
+        CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + (int) experts, assignments);
+    const int pcfg = moe_prefill_cfg();
+    const int pcols = pcfg == 0 ? 32 : 64;
+
+    MoeMkGemvArgs gu = {};
+    gu.A = reinterpret_cast<const half*>(gu_had.data_ptr());
+    gu.expert_offsets = offsets_ptr; gu.expert_chunks = chunks_ptr; gu.num_chunks = chunk_count_ptr;
+    gu.B_table_0 = gt; gu.B_table_1 = ut;
+    gu.K_table_0 = gK; gu.K_table_1 = uK;
+    gu.C = gu_out.data_ptr();
+    gu.size_k = MOE_HIDDEN; gu.size_n = intermediate;
+    gu.experts = (int) experts; gu.assignments = assignments;
+    run_mk_stage(union_ks(gate_ks, up_ks), gu, true, true, pcfg,
+                 dim3(intermediate / pcols, chunk_slots, 2), stream);
+
+    moe_prefill_had_rows_kernel<false, false>
+        <<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsvh, usvh,
+     assignments, intermediate, experts, false);
+
+    const int activation_count = assignments * intermediate;
+    half* gu_ptr = reinterpret_cast<half*>(gu_out.data_ptr());
+    moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
+    (gu_ptr, gu_ptr + activation_count, gu_ptr, activation_count);
+
+    moe_prefill_had_rows_kernel<true, false>
+        <<<dim3(assignments, intermediate / 128), 32, 0, stream>>>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsuh, dsuh,
+     assignments, intermediate, experts, false);
+
+    MoeMkGemvArgs dn = {};
+    dn.A = reinterpret_cast<const half*>(gu_out.data_ptr());
+    dn.expert_offsets = offsets_ptr; dn.expert_chunks = chunks_ptr; dn.num_chunks = chunk_count_ptr;
+    dn.B_table_0 = dt; dn.B_table_1 = dt;
+    dn.K_table_0 = dK; dn.K_table_1 = dK;
+    dn.C = down_out.data_ptr();
+    dn.size_k = intermediate; dn.size_n = MOE_HIDDEN;
+    dn.experts = (int) experts; dn.assignments = assignments;
+    run_mk_stage(down_ks, dn, true, false, pcfg, dim3(MOE_HIDDEN / pcols, chunk_slots, 1), stream);
+
+    moe_prefill_had_rows_kernel<false, true>
+        <<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
+    (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsvh, dsvh,
+     assignments, MOE_HIDDEN, experts, false);
+
+    moe_prefill_weighted_reduce_kernel
+        <<<dim3(CEIL_DIVIDE(MOE_HIDDEN, 256), rows), 256, 0, stream>>>
+    (reinterpret_cast<const float*>(down_out.data_ptr()), selected_ptr, weights_ptr,
+     inverse_ptr, counts_ptr, reinterpret_cast<float*>(output.data_ptr()),
+     rows, experts, MOE_HIDDEN);
+    cuda_check(hipPeekAtLastError());
+}
+
 #endif // USE_ROCM
 
 static int exl3_gemv_env_mode()
@@ -972,7 +1365,7 @@ static int exl3_gemv_cfg(int cc, int size_m, int size_k, int size_n, int K, int 
 {
     if (mode == 0) return -1;
 #if defined(USE_ROCM)
-    if (K < 2 || K > 6) return -1;
+    if (K < 2 || K > 8) return -1;
 #else
     if (K < 2 || K > 4) return -1;
 #endif
@@ -1028,8 +1421,11 @@ static void* exl3_gemv_select_kernel(int bits, int cb, bool c_fp32, int mmode, i
     SEL_GRID(3, 1) SEL_GRID(3, 2)
     SEL_GRID(5, 1) SEL_GRID(5, 2)
     SEL_GRID(6, 1) SEL_GRID(6, 2)
+    SEL_GRID(7, 1) SEL_GRID(7, 2)
+    SEL_GRID(8, 1) SEL_GRID(8, 2)
     SEL_MMODE2_GRID(3, 2) SEL_MMODE2_GRID(4, 1) SEL_MMODE2_GRID(4, 2)
     SEL_MMODE2_GRID(5, 2) SEL_MMODE2_GRID(6, 1) SEL_MMODE2_GRID(6, 2)
+    SEL_MMODE2_GRID(7, 1) SEL_MMODE2_GRID(7, 2) SEL_MMODE2_GRID(8, 1) SEL_MMODE2_GRID(8, 2)
     #undef SEL_MMODE2_GRID
     #undef SEL_GRID
     #undef SEL
@@ -1075,7 +1471,7 @@ bool exl3_gemv_try_launch
     // that could actually take this path
     if (!has_su_sv) return false;
 #if defined(USE_ROCM)
-    if (K < 2 || K > 6) return false;
+    if (K < 2 || K > 8) return false;
 #else
     if (K < 2 || K > 4) return false;
 #endif

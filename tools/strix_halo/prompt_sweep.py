@@ -31,12 +31,18 @@ NDT = os.environ.get("NDT", "2")
 DC = os.environ.get("DC", "0.4")
 DDS = os.environ.get("DDS", "1") != "0"
 LABEL = os.environ.get("LABEL", "")
+MODEL = os.environ.get("MODEL", "")       # empty = bench_mtp.py's default pack
+CACHE = os.environ.get("CACHE", "")       # empty = bench_mtp.py's default cache size
 
 env = os.environ.copy()
 env.setdefault("EXL3_MOE_CFG", "2")
 env.setdefault("EXL3_HIP_PREFILL_MIN_ROWS", "2")
 
 args = ["-n", str(N), "-ndt", NDT, "-g"]
+if MODEL:
+    args += ["-m", os.path.expanduser(MODEL)]
+if CACHE:
+    args += ["-c", CACHE]
 if DDS:
     args += ["-dds", "-dc", DC]
 cfg = f"ndt={NDT} " + (f"dynamic dc={DC}" if DDS else "static")

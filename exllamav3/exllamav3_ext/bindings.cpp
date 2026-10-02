@@ -338,6 +338,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
     m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
           "exl3_moe_gfx12_k3_prefill");
+    m.def("exl3_moe_mk", &exl3_moe_mk, "exl3_moe_mk");
+    m.def("exl3_moe_mk_prefill", &exl3_moe_mk_prefill, "exl3_moe_mk_prefill");
     m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
           "routing_std_gfx12_bsz1");
     m.def("dsa_topk_gfx12", &dsa_topk_gfx12, "dsa_topk_gfx12");

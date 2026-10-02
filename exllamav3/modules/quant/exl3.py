@@ -24,6 +24,7 @@ _EXL3_GEMV_HIP_MMODE1_MAX_M = 8
 _EXL3_GEMV_HIP_MMODE2_VARIANTS = frozenset({
     (3, False, True), (4, True, False), (4, False, True),
     (5, False, True), (6, True, False), (6, False, True),
+    (7, True, False), (7, False, True), (8, True, False), (8, False, True),
 })
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
@@ -183,7 +184,7 @@ class LinearEXL3:
                              (self.K, self.mcg, self.mul1) in _EXL3_GEMV_HIP_MMODE2_VARIANTS)
                         and self.in_features % 128 == 0
                         and self.out_features % 128 == 0
-                        and 2 <= self.K <= 6
+                        and 2 <= self.K <= 8
                         and (self.K == 4 or self.mcg or self.mul1)):
                     return self.hip_gemv(x, out_dtype)
 

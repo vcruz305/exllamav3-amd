@@ -1,85 +1,116 @@
-# Mixed-K on gfx1151: what the port actually requires
+# Mixed-K MoE on gfx1151
 
-Established 2026-10-01 while porting mixed-K decode from `vcruz305/exllamav3`
-(branch `exp/coop-mixedk`, CUDA) into this fork. Recorded here because the obvious
-plan — copy the CUDA mixed-K files across — is **wrong**, and the reason is not
-visible from the nvsrc side.
+How mixed-K EXL3 packs (experts quantized at different bitrates) run on this fork, and why it
+is built this way. Measured on framework2 (Ryzen AI Max+ 395 / Radeon 8060S, gfx1151, 128 GB).
 
-## The CUDA mixed-K kernels cannot be copied in
+## Why the CUDA mixed-K kernels are not ported
 
-`exllamav3/exllamav3_ext/build_config.py` keeps them out of ROCm builds entirely:
+The NVIDIA fork's mixed-K work (`exl3_moe_mixedk_*`, CoopMK) lives in `exl3_moe.cu`,
+`exl3_moe_coop.cu`, `comp_units/` and `libtorch/blocksparse_mlp.cpp`. `build_config.py`
+excludes all of them from ROCm builds; they pull in CUDA-only headers, so copying them across
+does nothing. The fused MoE path that does exist on ROCm is the grouped GEMV route in
+`quant/exl3_gemv.cu` (`exl3_moe_gfx12_k3` / `_prefill`), whose GEMV body is compiled for K=3.
 
-```python
-ROCM_EXCLUDE_DIRS  = {'parallel', 'comp_units'}
-ROCM_ALLOW_PREFIXES = ('quant/comp_units/exl3_gemv_int8_inst_',)
-ROCM_EXCLUDE_FILES = { ..., 'quant/exl3_moe.cu', 'quant/exl3_moe_coop.cu',
-                       'quant/exl3_kernel_map.cu', 'libtorch/blocksparse_mlp.cpp', ... }
-```
+## What blocked mixed-K packs
 
-So on gfx1151 these never compile or link:
+1. `multilinear.py` asserts one K per MultiLinear, so a mixed-K pack aborted at load.
+2. With that gated off, mixed-K layers fell to the dense per-expert loop: about 3,450 device
+   calls per token, each paying ~11 us of fixed launch/setup cost to move ~4 us of bytes.
+   6.5 tok/s without MTP. A no-op experiment (device calls stubbed, Python unchanged) put
+   ~65 % of that time on the device side, so the fix had to cut device calls, not host Python.
+3. High-bitrate packs store their non-expert weights (attention, linear attention, shared
+   experts, lm_head) at 8 bpw. The dense HIP GEMV stopped at K=6, so every one of them went
+   through reconstruct + hgemm: ~350 reconstructs per token, about 90 ms of the 143 ms per
+   token left after the MoE fix.
 
-- `exl3_moe.cu`, `exl3_moe_coop.cu`, `exl3_kernel_map.cu`
-- the whole `comp_units/` tree except the `exl3_gemv_int8_inst_*` instantiations —
-  which is exactly where nvsrc puts `exl3_moe_mixedk_inst_*.cu` and
-  `exl3_moe_coopmk_inst_*.cu`
-- `libtorch/blocksparse_mlp.cpp`, the binding layer for the fused MoE entry points
+## What this change does
 
-Confirmed against the built ABI rather than only by reading source. On framework2:
+**Mixed-K grouped route** (`exl3_moe_mk`, `exl3_moe_mk_prefill`). Same stage sequence and the
+same helper kernels as the K3 route (input Hadamard, gate/up GEMV, svh, SiLU, down GEMV,
+weighted reduce). Only the two GEMV stages differ: each is launched once per bitrate the layer
+uses, over the full slot grid. A block whose expert has a different K returns before touching
+memory, so every slot is computed exactly once, by the launch compiled for its K. The bitrate
+list per projection is fixed at load, so there is no host sync. Per-expert K tables are device
+`int32[E]`. One translation unit per bitrate (`exl3_gemv_moe_mk_k{3..7}.cu`).
 
-```
->>> import torch, exllamav3_ext as e
->>> [s for s in dir(e) if 'moe' in s.lower()]
-['exl3_moe_cpu_forward', 'exl3_moe_cpu_free_layer', 'exl3_moe_cpu_has_avx2',
- 'exl3_moe_cpu_has_avx512_vbmi', 'exl3_moe_cpu_has_avx512_vnni',
- 'exl3_moe_cpu_make_layer', 'exl3_moe_cpu_set_memops', 'exl3_moe_cpu_set_prof',
- 'exl3_moe_cpu_worker_run', 'exl3_moe_flag_wait', 'exl3_moe_flag_write',
- 'exl3_moe_gfx12_k3', 'exl3_moe_gfx12_k3_prefill']
-```
+Routing (`block_sparse_mlp.py`): the K3 route keeps every layer it had; `support_hip_grouped`
+is unchanged for uniform-K3 packs. The mixed-K route takes the grouped-shape layers the K3
+kernel cannot: mixed K, or uniform K other than 3. `EXL3_HIP_MOE_MK=0` turns it off.
 
-There is **no K4..K8 and no mixed-K entry point**. Despite the `gfx12` name the
-symbol is usable on gfx1151 — it is gated on `exl3_gemv_wmma_family(device) != 0`
-and only uses `exl3_gemv_kernel_body`, which is already ported to every WMMA family.
+**Dense HIP GEMV at 7 and 8 bpw.** The GEMV body already decoded 5 and 6 bpw through
+`dq_dispatch` from the staged tile. 7 and 8 use the same staged path (`LOADS` rounds up as for
+K5), with instances added to `exl3_gemv_select_kernel` and the K caps raised to 8 in
+`exl3_gemv_cfg`, `exl3_gemv_try_launch` and `LinearEXL3.forward`.
 
-## The real port target: exl3_moe_gfx12_k3 in exl3_gemv.cu
+## Results
 
-`exl3_gemv.cu` **does** build on ROCm, and it holds the only fused grouped-MoE decode
-kernel this fork has. Mixed-K means generalizing it:
+Per-token device calls on CYBER-FROST, decode without MTP (`mk_census.py`):
 
-- `exl3_gemv_kernel_body<3, FP32, 2, 0, MOE_CFG, true>` — line 204 (decode stage A/B)
-- `exl3_gemv_kernel_body<3, FP32, 2, 2, CFG, true>` — line 440 (prefill)
-- host-side `TORCH_CHECK(intermediate == 640 || intermediate == 768, ...)`
-- `constexpr int MOE_HIDDEN = 2560; MOE_TOP_K = 10; MOE_MAX_ROWS = 16;` (lines 49-51)
+| | before | after |
+|---|---|---|
+| wall time per token | 188 ms | 51 ms |
+| device calls per token | ~3,450 | ~490 |
+| reconstruct + hgemm per token | ~390 | 0 |
 
-K=3 is a **template** parameter, which is favourable: mixed-K wants per-expert K, so
-the work is dispatching a K per (token, expert) slot instead of one compile-time K
-for the whole launch. Note the sibling `gemv_by_m` config picker already branches on
-K (`if (K == 3 && cc == CC_ADA) ...` around line 1000), so per-K dispatch exists in
-the surrounding code.
+Six-prompt mean (`prompt_sweep.py`, NDT=3 DC=0.6 DDS=1, 512 tokens, greedy, the production
+default; `EXL3_MOE_CFG=2 EXL3_HIP_PREFILL_MIN_ROWS=2`):
 
-## Why the target pack needs it
+| pack | mean tok/s | median | min / max | acceptance |
+|---|---|---|---|---|
+| Qwen3.8-Flash-Next 3.05 bpw (flat K3) | 44.74 | 45.00 | 41.61 / 47.62 | 71.0 % |
+| CYBER-FROST 3.87 bpw (mixed K) | **39.27** | 39.38 | 34.49 / 44.96 | 74.0 % |
 
-`vcruz305/CYBER-FROST-3.8-EXL3-SAGE-3.87bpw`, model_type `qwen4_exp`, 48 layers,
-24576 experts (512/layer), top_k 10, has genuine per-expert K variation. Bitrate is
-read off the trellis row width in `quantization_config.json` -> `tensor_storage`:
+Single prompt, before vs after (`bench_mtp.py -g`, "Explain gradient descent in two
+sentences:", 256 tokens, cache 2048):
 
-| projection | trellis shape | bpw | expert count |
+| pack | config | before | after |
 |---|---|---|---|
-| gate/up | `(160, 40, 48)` | 3 | 13984 |
-| gate/up | `(160, 40, 64)` | 4 | 10592 |
-| down | `(40, 160, 48)` | 3 | 2167 |
-| down | `(40, 160, 64)` | 4 | 12940 |
-| down | `(40, 160, 80)` | 5 | 5610 |
-| down | `(40, 160, 96)` | 6 | 3768 |
-| down | `(40, 160, 112)` | 7 | 91 |
+| flat K3 | no MTP | 26.55 | 26.35 |
+| flat K3 | MTP ndt3 dds dc0.6 | 43.50 | 43.65 |
+| mixed K | no MTP | 6.50 | **22.27** |
+| mixed K | MTP ndt3 dds dc0.6 | 10.42 | **36.87** |
 
-Five distinct K on `down_proj` alone. A K=3-only kernel cannot run this pack's MoE
-at full rate, and the pure-GEMV fallback is the slow path the README already
-measures (~17 tok/s, versus 40+ for the tuned WMMA path on the 3.05 bpw pack).
+The flat-K pack is unchanged, inside the README's >1 tok/s run-to-run drift.
 
-## Definition of done for this work
+Why mixed-K stays below flat-K: it reads more bytes per token. From `tensor_storage`,
+non-expert weights plus the routed share of the experts (10 of 512):
 
-Per `AGENTS.md`, PPL must hold 4.225935 on the **Qwen3.8-Flash-Next 3.05 bpw** pack.
-That pack is a different model from the one this port targets, so establish the
-correct parity baseline for CYBER-FROST separately — do not assume the 3.05 bpw
-number transfers. `tools/strix_halo/greedy_ab.py` (run `KNOB=x` vs `KNOB=x` first for
-the noise floor) and `tie_check.py` remain the A/B tools.
+| pack | dense weights | expert weights | bytes per token |
+|---|---|---|---|
+| Qwen3.8-Flash-Next 3.05 bpw | 3.46 GiB | 42.63 GiB | 4.30 GiB |
+| CYBER-FROST 3.87 bpw | 4.71 GiB | 53.50 GiB | 5.76 GiB |
+
+That is 1.34x the bytes. Scaling the flat-K six-prompt mean by the byte ratio predicts
+33.4 tok/s; mixed-K measures 39.27 (88 % of flat-K), helped by its higher MTP acceptance.
+The remaining gap is bytes, not dispatch.
+
+## Correctness
+
+- `tools/strix_halo/mk_parity.py`: layer forward, grouped route vs the dense reference path,
+  real routing at rows 1, 3, 4, 16 (decode) and 37 (prefill) on four layers, including the one
+  with the most K7 experts, plus forced routing onto K7/K6 experts. Worst relative error
+  2.4e-4, cosine >= 0.99999994. PASS.
+- `tools/strix_halo/gemv_k_parity.py`: dense HIP GEMV vs reconstruct + hgemm for every
+  (K, shape) class in the pack, K=3..8 including lm_head, rows 1/3/9/16. Worst 1.5e-6. PASS.
+- PPL (`eval/ppl.py -r 20 -l 1024`):
+  - CYBER-FROST: grouped route 4.262460; dense reference path 4.263050.
+  - Qwen3.8-Flash-Next: 4.225935 with `EXL3_HIP_F32OUT_VIA_F16=0`, identical on the old and
+    new builds. With that knob at its default (1), both builds read 4.223205. The 4.225935 in
+    AGENTS.md predates that knob (commit fa32aaa); this change moves neither number.
+- Generated text is coherent with the reasoning block intact; MTP acceptance 74 % (six-prompt).
+
+## Knobs
+
+- `EXL3_HIP_MOE_MK=0` disables the mixed-K grouped route (dense per-expert loop).
+- `EXL3_GEMV=0` still disables all HIP GEMV, including this route.
+- `EXL3_HIP_GROUPED_MOE=0` / `EXL3_HIP_GROUPED_MOE_PREFILL=0` disable the decode / prefill
+  grouped routes, K3 and mixed-K alike.
+
+## Harnesses
+
+- `mk_parity.py`, `gemv_k_parity.py`: correctness, above.
+- `mk_census.py`: per-token extension call counts and which (K, rows) still hit
+  reconstruct + hgemm.
+- `mk_ab.sh`: flat-K vs mixed-K, with and without MTP, sequential on one box.
+- `mk_ppl_control.sh`: old/new `.so` x `EXL3_HIP_F32OUT_VIA_F16` PPL matrix.
+- `prompt_sweep.py`: takes `MODEL=` and `CACHE=` so the six-prompt mean runs on any pack.

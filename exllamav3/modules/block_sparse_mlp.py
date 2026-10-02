@@ -108,6 +108,44 @@ class HIPPrefillBuffers:
 
 
 @dataclass
+class HIPMixedKTables:
+    # Per-expert device pointer tables (int64[E]) and bitrate tables (int32[E]) per projection,
+    # plus the sorted set of bitrates each projection uses (host-side, fixed at load). Holds the
+    # same raw-pointer contract as MultiLinear: the experts' tensors outlive the tables
+    gate_trellis: torch.Tensor
+    gate_suh: torch.Tensor
+    gate_svh: torch.Tensor
+    up_trellis: torch.Tensor
+    up_suh: torch.Tensor
+    up_svh: torch.Tensor
+    down_trellis: torch.Tensor
+    down_suh: torch.Tensor
+    down_svh: torch.Tensor
+    gate_K: torch.Tensor
+    up_K: torch.Tensor
+    down_K: torch.Tensor
+    gate_ks: list
+    up_ks: list
+    down_ks: list
+
+
+def _build_hip_mk_tables(device, gates, ups, downs) -> HIPMixedKTables:
+    def ptrs(ls, attr):
+        return torch.tensor([getattr(l.inner, attr).data_ptr() for l in ls], dtype = torch.long, device = device)
+    def ks(ls):
+        return torch.tensor([l.inner.K for l in ls], dtype = torch.int, device = device)
+    return HIPMixedKTables(
+        gate_trellis = ptrs(gates, "trellis"), gate_suh = ptrs(gates, "suh"), gate_svh = ptrs(gates, "svh"),
+        up_trellis = ptrs(ups, "trellis"), up_suh = ptrs(ups, "suh"), up_svh = ptrs(ups, "svh"),
+        down_trellis = ptrs(downs, "trellis"), down_suh = ptrs(downs, "suh"), down_svh = ptrs(downs, "svh"),
+        gate_K = ks(gates), up_K = ks(ups), down_K = ks(downs),
+        gate_ks = sorted({l.inner.K for l in gates}),
+        up_ks = sorted({l.inner.K for l in ups}),
+        down_ks = sorted({l.inner.K for l in downs}),
+    )
+
+
+@dataclass
 class ExpertsCFG:
     yh: torch.Tensor
     interm_g: torch.Tensor
@@ -496,6 +534,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.hip_prefill_buffers = None
         self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
+        self.support_hip_mk = False
+        self.support_hip_mk_prefill = False
+        self.hip_mk = None
         self._cpu_init_state()
 
     @override
@@ -561,6 +602,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.hip_grouped_lora_blocked = True
             self.support_hip_grouped = False
             self.support_hip_prefill = False
+            self.support_hip_mk = False
+            self.support_hip_mk_prefill = False
 
 
     def load_local(self, **kwargs):
@@ -578,15 +621,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
         # Mixed-K: skip MultiLinear/fused when experts differ in (K, mcg, mul1). MultiLinear
-        # asserts a single uniform K (multilinear.py), and the gfx1151 grouped kernels are
-        # hard-wired to K == 3 (support_hip_grouped below), so a mixed-K layer must take the
-        # dense per-expert path, which already dispatches each expert at its own bitrate
+        # asserts a single uniform K (multilinear.py) and the K3 grouped kernels are hard-wired
+        # to K == 3, so a mixed-K layer either takes the mixed-K grouped HIP route (decided
+        # below, support_hip_mk) or the dense per-expert loop, which dispatches each expert at
+        # its own bitrate
         def _uniform_q(ls):
             return not ls or len({(l.inner.K, l.inner.mcg, l.inner.mul1) for l in ls}) <= 1
         self.uniform_expert_q = self.is_quantized and all(
             _uniform_q(ls) for ls in ((self.gates if self.gated else []), self.ups, self.downs))
-        if self.is_quantized and not self.uniform_expert_q:
-            print(f" -- Mixed-K experts in {self.key}: dense per-expert path")
 
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
@@ -654,8 +696,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # filtering. NOTE: other gfx12-only kernels (routing, hyperconnection
             # fusion) still need an explicit family-1 / arch-string test.
             hip_grouped_device = ext.exl3_gemv_supported(device_index)
-        self.support_hip_grouped = (
-            hip_grouped_device and self.is_quantized and self.uniform_expert_q and
+        # Everything the grouped kernels need except a single bitrate: the K3 route additionally
+        # requires uniform K (support_hip_grouped), the mixed-K route takes the rest
+        hip_grouped_shape_ok = (
+            hip_grouped_device and self.is_quantized and
             self.gated and self.activation_fn == "silu" and
             self.hidden_size == 2560 and self.intermediate_size_padded in (640, 768) and
             self.num_experts_per_tok == 10 and self.interm_dtype == torch.half and
@@ -665,6 +709,27 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
             not self.config.infer_params.no_reconstruct
         )
+        self.support_hip_grouped = hip_grouped_shape_ok and self.uniform_expert_q
+
+        # Mixed-K grouped route: per-expert bitrate tables, one GEMV launch per bitrate present.
+        # Takes every grouped-shape layer the K3 kernel cannot: mixed K, and uniform K != 3
+        # (e.g. an all-K4 layer). Opt out with EXL3_HIP_MOE_MK=0 (dense per-expert loop)
+        self.support_hip_mk = False
+        self.support_hip_mk_prefill = False
+        self.hip_mk = None
+        all_experts = self.gates + self.ups + self.downs
+        k3_kernel_ok = all(l.inner.K == 3 and bool(l.inner.mul1) and not l.inner.mcg for l in all_experts)
+        if (
+            hip_grouped_shape_ok and not (self.uniform_expert_q and k3_kernel_ok) and
+            hasattr(ext, "exl3_moe_mk") and
+            os.environ.get("EXL3_HIP_MOE_MK", "1") != "0" and
+            all(bool(l.inner.mul1) and not l.inner.mcg and 3 <= l.inner.K <= 7 for l in all_experts)
+        ):
+            self.hip_mk = _build_hip_mk_tables(self.device, self.gates, self.ups, self.downs)
+            self.support_hip_mk = True
+            self.support_hip_mk_prefill = hasattr(ext, "exl3_moe_mk_prefill")
+            print(f" -- {'Mixed-K' if not self.uniform_expert_q else 'Uniform non-K3'} experts in {self.key}: grouped HIP route "
+                  f"(gate K {self.hip_mk.gate_ks}, up K {self.hip_mk.up_ks}, down K {self.hip_mk.down_ks})")
 
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
@@ -757,7 +822,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
         self.experts_cfg = cfg
 
-        if self.support_hip_grouped:
+        if self.support_hip_grouped or self.support_hip_mk:
             max_assignments = _HIP_GROUPED_MAX_ROWS * numex
             # Projection-major flat storage keeps every prefix slice contiguous up to the
             # runtime grouped-row cap. All layers on a device share these max-sized cache
@@ -775,7 +840,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     device, (_HIP_GROUPED_MAX_ROWS, H), torch.float, "moe_gfx12_output"),
             )
 
-        if self.support_hip_prefill:
+        if self.support_hip_prefill or self.support_hip_mk_prefill:
             # Workspace is allocated lazily at dispatch sized to the actual chunk
             # (see _ensure_hip_prefill_buffers), not reserved at the 2048-row cap, so
             # chunk512 serving does not overallocate VRAM.
@@ -1122,6 +1187,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.hip_prefill_buffers = None
         self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
+        self.support_hip_mk = False
+        self.support_hip_mk_prefill = False
+        self.hip_mk = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -1307,6 +1375,82 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.multi_down.ptrs_trellis,
                 self.multi_down.ptrs_suh,
                 self.multi_down.ptrs_svh,
+                buffers.gu_had[:2 * assignments],
+                buffers.gu_out[:2 * assignments],
+                buffers.down_out[:assignments],
+                buffers.expert_offsets,
+                buffers.inverse_order[:assignments],
+                buffers.expert_chunks,
+                buffers.chunk_count,
+            )
+            final_hidden_states = output.view(x.shape)
+
+        # Mixed-K grouped decode/verify: same shape envelope and buffers as the K3 route above,
+        # one GEMV launch per bitrate present in the layer
+        elif (
+            self.support_hip_mk and _hip_grouped_rows_eligible(bsz) and
+            self.tp_mode is None and self.act_limit == 0 and
+            tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN) and y.dtype == torch.half and
+            tuple(selected_experts.shape) == (bsz, _HIP_ROUTER_TOP_K) and
+            selected_experts.dtype == torch.long and
+            tuple(routing_weights.shape) == (bsz, _HIP_ROUTER_TOP_K) and
+            routing_weights.dtype == torch.half and
+            y.is_contiguous() and selected_experts.is_contiguous() and routing_weights.is_contiguous() and
+            os.environ.get("EXL3_HIP_GROUPED_MOE", "1") != "0" and
+            (bsz == 1 or os.environ.get("EXL3_HIP_GROUPED_MOE_MULTIROW", "1") != "0") and
+            os.environ.get("EXL3_GEMV", "1") != "0" and
+            not params.get("activate_all_experts") and
+            not params.get("reconstruct") and not params.get("autosplit_measure")
+        ):
+            buffers = self.hip_grouped_buffers
+            mk = self.hip_mk
+            assignments = bsz * _HIP_ROUTER_TOP_K
+            output = buffers.output[:bsz]
+            ext.exl3_moe_mk(
+                y, output, selected_experts, routing_weights,
+                mk.gate_trellis, mk.gate_suh, mk.gate_svh,
+                mk.up_trellis, mk.up_suh, mk.up_svh,
+                mk.down_trellis, mk.down_suh, mk.down_svh,
+                mk.gate_K, mk.up_K, mk.down_K,
+                mk.gate_ks, mk.up_ks, mk.down_ks,
+                buffers.gu_had[:2 * assignments],
+                buffers.gu_out[:2 * assignments],
+                buffers.down_had[:assignments],
+                buffers.down_out[:assignments],
+            )
+            final_hidden_states = output.view(x.shape)
+
+        # Mixed-K grouped prefill / multi-row verify (expert-sorted 16-row chunks)
+        elif (
+            self.support_hip_mk_prefill and self.tp_mode is None and
+            self.num_local_experts in (None, self.num_experts) and
+            _hip_prefill_rows_eligible(bsz) and
+            y.dtype == torch.half and y.is_contiguous() and
+            selected_experts.is_contiguous() and routing_weights.is_contiguous() and
+            os.environ.get("EXL3_HIP_GROUPED_MOE_PREFILL", "1") != "0" and
+            os.environ.get("EXL3_GEMV", "1") != "0" and
+            not params.get("activate_all_experts") and
+            not params.get("reconstruct") and not params.get("autosplit_measure")
+        ):
+            num_tokens, top_k = selected_experts.shape
+            flat_expert_local = selected_experts.reshape(-1)
+            E_local = self.num_experts
+            order = flat_expert_local.argsort(stable = True)
+            if _moe_sync_free_count():
+                expert_count = _scatter_expert_count(flat_expert_local, E_local + 1)
+            else:
+                expert_count = torch.bincount(flat_expert_local, minlength = E_local + 1)
+            buffers = self._ensure_hip_prefill_buffers(num_tokens)
+            mk = self.hip_mk
+            assignments = num_tokens * top_k
+            output = buffers.output[:num_tokens]
+            ext.exl3_moe_mk_prefill(
+                y, output, selected_experts, routing_weights, order, expert_count,
+                mk.gate_trellis, mk.gate_suh, mk.gate_svh,
+                mk.up_trellis, mk.up_suh, mk.up_svh,
+                mk.down_trellis, mk.down_suh, mk.down_svh,
+                mk.gate_K, mk.up_K, mk.down_K,
+                mk.gate_ks, mk.up_ks, mk.down_ks,
                 buffers.gu_had[:2 * assignments],
                 buffers.gu_out[:2 * assignments],
                 buffers.down_out[:assignments],
