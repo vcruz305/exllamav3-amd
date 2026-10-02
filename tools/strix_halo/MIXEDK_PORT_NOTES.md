@@ -126,8 +126,37 @@ Context (`ctx_sweep.py`, cold random-id prompt filling the cache, 128 decode tok
 
 The full 262,144-token context (`max_position_embeddings`) works on the mixed-K pack. The
 cache is one page pool shared by all sequences, not a per-stream allocation; each sequence is
-capped at 262,144 by position embeddings. Prefill is ~400 tok/s on both packs at every depth,
-which is the next thing to fix: it is the same rate with or without mixed K.
+capped at 262,144 by position embeddings.
+
+## Prefill
+
+Measured with `prefill_profile.py` (cold random-id prompt, chunk 2048, `SYNC=0`). The rate is
+the same for both packs: prefill was never mixed-K-bound.
+
+| change | 8k tok/s | 32k tok/s |
+|---|---|---|
+| baseline | 434 | ~400 |
+| MoE Hadamard rows: 8 warps per block instead of one 32-thread block per row slice | 469 | |
+| Triton norm + tail for the prefill GatedResidual mix (`modules/hc_triton.py`) | 557 | |
+| Triton RMS / gated RMS norms ahead of the torch fallbacks (`norm_triton.py`); stride-aware conv1d (drops a transpose copy per GDN layer) | **637** | **619** |
+
+Where the time went (`prefill_profile.py` with `SYNC=1`, 8k): the GatedResidual mix ran its
+norm through the multi-pass `ext_fallbacks.rms_norm` (norm.cu is not built on ROCm) and a
+five-kernel torch tail, ~26 GB/s, 24 % of prefill. The GatedDeltaNet output norm took the same
+fallback, and `qkv.transpose(1, 2).to(bf16).contiguous()` cost ~4 ms per layer.
+
+Numerics: the Hadamard and conv changes are bit-exact. The Triton norms sum in a different fp32
+order, so about 1 output in 10,000 rounds to the neighbouring fp16 value; scored against fp64
+(`norm_truth.py`) their mean and max error equal the torch path's. PPL moves within the same
+band as the existing `EXL3_HIP_F32OUT_VIA_F16` knob: flat 4.225935 -> 4.230441 (knob 0) /
+4.223205 -> 4.218831 (default); mixed 4.262460 -> 4.261538. `tie_check.py`: 0 argmax flips.
+`EXL3_TRITON_NORM=0 EXL3_GR_TRITON=0` reproduces 4.225935 exactly. Decode is unchanged
+(six-prompt: flat 46.38, mixed 39.51).
+
+Tried and reverted: decoding each MoE weight tile once across up to 64 routed rows (one trellis
+decode, four WMMA M tiles). No change. Routing all 20,480 assignments onto 40 experts (weights
+read ~once) only cut the grouped GEMV from 25.1 to 21.5 ms, so neither weight traffic nor decode
+bounds the MoE prefill GEMV.
 
 ## Knobs
 
@@ -135,6 +164,8 @@ which is the next thing to fix: it is the same rate with or without mixed K.
 - `EXL3_GEMV=0` still disables all HIP GEMV, including this route.
 - `EXL3_HIP_GROUPED_MOE=0` / `EXL3_HIP_GROUPED_MOE_PREFILL=0` disable the decode / prefill
   grouped routes, K3 and mixed-K alike.
+- `EXL3_TRITON_NORM=0` keeps the torch RMS-norm fallbacks; `EXL3_GR_TRITON=0` keeps the torch
+  prefill GatedResidual mix.
 
 ## Harnesses
 
@@ -144,3 +175,9 @@ which is the next thing to fix: it is the same rate with or without mixed K.
 - `mk_ab.sh`: flat-K vs mixed-K, with and without MTP, sequential on one box.
 - `mk_ppl_control.sh`: old/new `.so` x `EXL3_HIP_F32OUT_VIA_F16` PPL matrix.
 - `prompt_sweep.py`: takes `MODEL=` and `CACHE=` so the six-prompt mean runs on any pack.
+- Prefill: `prefill_profile.py` (per-module + per-extension-call time; `SYNC=0` for wall rate),
+  `prefill_trace.py` (torch.profiler kernels), `module_trace.py` (one module's kernels),
+  `copy_trace.py` (call sites of large copies), `moe_prefill_scale.py` / `moe_bound.py` (grouped
+  MoE prefill scaling and routing-concentration test), `norm_parity.py` / `norm_truth.py` /
+  `gr_mix_bench.py` / `conv_parity.py` (parity), `pf_verify.sh` (full gate: parity, PPL,
+  prefill, six-prompt decode).

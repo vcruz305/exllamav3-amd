@@ -16,6 +16,7 @@ import triton.language as tl
 @triton.jit
 def _causal_conv1d_update_slotted_kernel(
     x,
+    sxb, sxd, sxs,       # x strides (batch, dim, seq): x may be a (b, s, d) tensor viewed as (b, d, s)
     conv_state,
     slots,
     weight,
@@ -60,7 +61,7 @@ def _causal_conv1d_update_slotted_kernel(
                 other = 0.0,
             )
             x_vals = tl.load(
-                x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+                x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
                 mask = mask_d[:, None] & mask_s[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
                 other = 0.0,
             )
@@ -101,7 +102,7 @@ def _causal_conv1d_update_slotted_kernel(
         other = 0.0,
     )
     x_vals = tl.load(
-        x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+        x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
         mask = mask_d[:, None] & valid_state[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
         other = 0.0,
     )
@@ -116,6 +117,7 @@ def _causal_conv1d_update_slotted_kernel(
 @triton.jit
 def _causal_conv1d_update_slotted_output_kernel(
     x,
+    sxb, sxd, sxs,       # x strides (batch, dim, seq): x may be a (b, s, d) tensor viewed as (b, d, s)
     conv_state,
     slots,
     weight,
@@ -156,7 +158,7 @@ def _causal_conv1d_update_slotted_output_kernel(
                 other = 0.0,
             )
             x_vals = tl.load(
-                x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+                x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
                 mask = mask_d[:, None] & mask_s[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
                 other = 0.0,
             )
@@ -186,6 +188,7 @@ def _causal_conv1d_update_slotted_output_kernel(
 @triton.jit
 def _causal_conv1d_update_slotted_state_kernel(
     x,
+    sxb, sxd, sxs,       # x strides (batch, dim, seq): x may be a (b, s, d) tensor viewed as (b, d, s)
     conv_state,
     slots,
     dim: tl.constexpr,
@@ -221,7 +224,7 @@ def _causal_conv1d_update_slotted_state_kernel(
         other = 0.0,
     )
     x_vals = tl.load(
-        x + (pid_b * dim + offs_d[:, None]) * seq_len + x_t[None, :],
+        x + pid_b * sxb + offs_d[:, None] * sxd + x_t[None, :] * sxs,
         mask = mask_d[:, None] & valid_state[None, :] & from_x[None, :] & (x_t[None, :] >= 0),
         other = 0.0,
     )
@@ -244,8 +247,9 @@ def causal_conv1d_update_slotted_triton(
 ) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError("causal_conv1d_update_slotted_triton requires CUDA tensors")
-    if not x.is_contiguous() or not conv_state.is_contiguous() or not weight.is_contiguous():
-        raise RuntimeError("causal_conv1d_update_slotted_triton requires contiguous x, conv_state, and weight")
+    # x may be strided (a (b, s, d) tensor viewed as (b, d, s)): the kernels take its strides
+    if not conv_state.is_contiguous() or not weight.is_contiguous():
+        raise RuntimeError("causal_conv1d_update_slotted_triton requires contiguous conv_state and weight")
     if conv_state.device != x.device:
         raise RuntimeError(f"conv_state is on {conv_state.device}, expected {x.device}")
     if slots.device != x.device:
@@ -282,6 +286,7 @@ def causal_conv1d_update_slotted_triton(
             grid = (bsz, triton.cdiv(dim, block_d))
             _causal_conv1d_update_slotted_kernel[grid](
                 x,
+                x.stride(0), x.stride(1), x.stride(2),
                 conv_state,
                 slots,
                 weight,
@@ -305,6 +310,7 @@ def causal_conv1d_update_slotted_triton(
             output_grid = (bsz, triton.cdiv(dim, block_d), triton.cdiv(seq_len, block_s))
             _causal_conv1d_update_slotted_output_kernel[output_grid](
                 x,
+                x.stride(0), x.stride(1), x.stride(2),
                 conv_state,
                 slots,
                 weight,
@@ -324,6 +330,7 @@ def causal_conv1d_update_slotted_triton(
             state_grid = (bsz, triton.cdiv(dim, block_d))
             _causal_conv1d_update_slotted_state_kernel[state_grid](
                 x,
+                x.stride(0), x.stride(1), x.stride(2),
                 conv_state,
                 slots,
                 dim,

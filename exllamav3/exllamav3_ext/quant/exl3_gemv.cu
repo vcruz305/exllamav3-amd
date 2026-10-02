@@ -320,8 +320,13 @@ __global__ void moe_prefill_metadata_kernel
 }
 
 
+// One warp per 128-wide row slice, MOE_HAD_ROWS_WARPS slices per block. The original launch
+// used one 32-thread block per slice (~410k blocks per prefill call); on gfx1151 too few of
+// those are resident to cover DRAM latency and the fp32 down pass ran at ~68 GB/s
+constexpr int MOE_HAD_ROWS_WARPS = 8;
+
 template <bool PRE_SCALE, bool FP32>
-__global__ __launch_bounds__(32)
+__global__ __launch_bounds__(32 * MOE_HAD_ROWS_WARPS)
 void moe_prefill_had_rows_kernel
 (
     const void* input,
@@ -334,17 +339,22 @@ void moe_prefill_had_rows_kernel
     int assignments,
     int width,
     int experts,
-    bool token_input
+    bool token_input,
+    int matrices
 )
 {
-    const int matrix = blockIdx.x;
+    const int slices = width / 128;
+    const int64_t flat = (int64_t) blockIdx.x * MOE_HAD_ROWS_WARPS + (threadIdx.x >> 5);
+    if (flat >= (int64_t) matrices * slices) return;
+    const int matrix = (int) (flat / slices);
+    const int slice = (int) (flat % slices);
     const int sorted_slot = matrix % assignments;
     const int projection = matrix / assignments;
     const int64_t original_slot = order[sorted_slot];
     const bool valid_order = original_slot >= 0 && original_slot < assignments;
     const int64_t expert = valid_order ? selected[original_slot] : -1;
     const int64_t* scale_table = projection == 0 ? scale_tables_0 : scale_tables_1;
-    const size_t output_offset = (size_t) matrix * width + blockIdx.y * 128;
+    const size_t output_offset = (size_t) matrix * width + slice * 128;
     const bool valid_expert = expert >= 0 && expert < experts &&
         expert_count[expert] <= MOE_PREFILL_MAX_EXPERT_ROWS;
     const int64_t scale_ptr = valid_expert ? scale_table[expert] : 0;
@@ -353,20 +363,23 @@ void moe_prefill_had_rows_kernel
         if constexpr (FP32)
         {
             float* output_ptr = reinterpret_cast<float*>(output) + output_offset;
-            for (int idx = threadIdx.x; idx < 128; idx += blockDim.x) output_ptr[idx] = 0.0f;
+            for (int idx = threadIdx.x & 31; idx < 128; idx += 32) output_ptr[idx] = 0.0f;
         }
         else
         {
             half* output_ptr = reinterpret_cast<half*>(output) + output_offset;
-            for (int idx = threadIdx.x; idx < 128; idx += blockDim.x)
+            for (int idx = threadIdx.x & 31; idx < 128; idx += 32)
                 output_ptr[idx] = __float2half_rn(0.0f);
         }
         return;
     }
 
-    const half* scale = reinterpret_cast<const half*>(scale_ptr);
+    // had_*_r_128_inner index the scale vector by blockIdx.y (the slice in the original
+    // one-block-per-slice grid). The slice is per warp here and blockIdx.y is 0 on this
+    // 1-D grid, so pass a scale pointer pre-offset to this slice
+    const half* scale = reinterpret_cast<const half*>(scale_ptr) + (size_t) slice * 128;
     const size_t input_row = token_input ? original_slot / MOE_TOP_K : matrix;
-    const size_t input_offset = input_row * width + blockIdx.y * 128;
+    const size_t input_offset = input_row * width + slice * 128;
     if constexpr (FP32)
         had_ff_r_128_inner<PRE_SCALE, !PRE_SCALE>
         (
@@ -383,6 +396,21 @@ void moe_prefill_had_rows_kernel
             scale,
             HAD_SCALE
         );
+}
+
+template <bool PRE_SCALE, bool FP32>
+static void launch_moe_had_rows
+(
+    const void* input, void* output, const int64_t* selected, const int64_t* order,
+    const int64_t* expert_count, const int64_t* st0, const int64_t* st1,
+    int assignments, int width, int experts, bool token_input, int matrices, cudaStream_t stream
+)
+{
+    const int64_t total = (int64_t) matrices * (width / 128);
+    const int blocks = (int) CEIL_DIVIDE(total, (int64_t) MOE_HAD_ROWS_WARPS);
+    moe_prefill_had_rows_kernel<PRE_SCALE, FP32><<<blocks, 32 * MOE_HAD_ROWS_WARPS, 0, stream>>>
+    (input, output, selected, order, expert_count, st0, st1, assignments, width, experts,
+     token_input, matrices);
 }
 
 template <bool FP32, bool TWO_PROJECTIONS, int CFG>
@@ -829,10 +857,8 @@ void exl3_moe_gfx12_k3_prefill
     (counts_ptr, order_ptr, offsets_ptr, inverse_ptr, chunks_ptr, chunk_count_ptr,
      experts, assignments);
 
-    dim3 had_gu_grid(2 * assignments, MOE_HIDDEN / 128);
-    moe_prefill_had_rows_kernel<true, false><<<had_gu_grid, 32, 0, stream>>>
-    (A.data_ptr(), gu_had.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsuh, usuh,
-     assignments, MOE_HIDDEN, experts, true);
+    launch_moe_had_rows<true, false>
+    (A.data_ptr(), gu_had.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsuh, usuh, assignments, MOE_HIDDEN, experts, true, 2 * assignments, stream);
 
     // num_chunks is computed on device (no host readback). Two host-side upper
     // bounds are always valid: sum_e ceil(count_e/16) <= ceil(A/16) + experts and
@@ -856,20 +882,16 @@ void exl3_moe_gfx12_k3_prefill
     }
     #undef PREFILL_GU_ARGS
 
-    moe_prefill_had_rows_kernel<false, false>
-        <<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
-    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsvh, usvh,
-     assignments, intermediate, experts, false);
+    launch_moe_had_rows<false, false>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsvh, usvh, assignments, intermediate, experts, false, 2 * assignments, stream);
 
     const int activation_count = assignments * intermediate;
     half* gu_ptr = reinterpret_cast<half*>(gu_out.data_ptr());
     moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
     (gu_ptr, gu_ptr + activation_count, gu_ptr, activation_count);
 
-    moe_prefill_had_rows_kernel<true, false>
-        <<<dim3(assignments, intermediate / 128), 32, 0, stream>>>
-    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsuh, dsuh,
-     assignments, intermediate, experts, false);
+    launch_moe_had_rows<true, false>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsuh, dsuh, assignments, intermediate, experts, false, assignments, stream);
 
     dim3 down_grid(MOE_HIDDEN / pcols, chunk_slots, 1);
     #define PREFILL_DN_ARGS \
@@ -883,10 +905,8 @@ void exl3_moe_gfx12_k3_prefill
     }
     #undef PREFILL_DN_ARGS
 
-    moe_prefill_had_rows_kernel<false, true>
-        <<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
-    (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsvh, dsvh,
-     assignments, MOE_HIDDEN, experts, false);
+    launch_moe_had_rows<false, true>
+    (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsvh, dsvh, assignments, MOE_HIDDEN, experts, false, assignments, stream);
 
     moe_prefill_weighted_reduce_kernel
         <<<dim3(CEIL_DIVIDE(MOE_HIDDEN, 256), rows), 256, 0, stream>>>
@@ -1229,10 +1249,8 @@ void exl3_moe_mk_prefill
     (counts_ptr, order_ptr, offsets_ptr, inverse_ptr, chunks_ptr, chunk_count_ptr,
      experts, assignments);
 
-    dim3 had_gu_grid(2 * assignments, MOE_HIDDEN / 128);
-    moe_prefill_had_rows_kernel<true, false><<<had_gu_grid, 32, 0, stream>>>
-    (A.data_ptr(), gu_had.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsuh, usuh,
-     assignments, MOE_HIDDEN, experts, true);
+    launch_moe_had_rows<true, false>
+    (A.data_ptr(), gu_had.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsuh, usuh, assignments, MOE_HIDDEN, experts, true, 2 * assignments, stream);
 
     const int chunk_slots = std::min(
         CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + (int) experts, assignments);
@@ -1250,20 +1268,16 @@ void exl3_moe_mk_prefill
     run_mk_stage(union_ks(gate_ks, up_ks), gu, true, true, pcfg,
                  dim3(intermediate / pcols, chunk_slots, 2), stream);
 
-    moe_prefill_had_rows_kernel<false, false>
-        <<<dim3(2 * assignments, intermediate / 128), 32, 0, stream>>>
-    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsvh, usvh,
-     assignments, intermediate, experts, false);
+    launch_moe_had_rows<false, false>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, gsvh, usvh, assignments, intermediate, experts, false, 2 * assignments, stream);
 
     const int activation_count = assignments * intermediate;
     half* gu_ptr = reinterpret_cast<half*>(gu_out.data_ptr());
     moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
     (gu_ptr, gu_ptr + activation_count, gu_ptr, activation_count);
 
-    moe_prefill_had_rows_kernel<true, false>
-        <<<dim3(assignments, intermediate / 128), 32, 0, stream>>>
-    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsuh, dsuh,
-     assignments, intermediate, experts, false);
+    launch_moe_had_rows<true, false>
+    (gu_out.data_ptr(), gu_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsuh, dsuh, assignments, intermediate, experts, false, assignments, stream);
 
     MoeMkGemvArgs dn = {};
     dn.A = reinterpret_cast<const half*>(gu_out.data_ptr());
@@ -1275,10 +1289,8 @@ void exl3_moe_mk_prefill
     dn.experts = (int) experts; dn.assignments = assignments;
     run_mk_stage(down_ks, dn, true, false, pcfg, dim3(MOE_HIDDEN / pcols, chunk_slots, 1), stream);
 
-    moe_prefill_had_rows_kernel<false, true>
-        <<<dim3(assignments, MOE_HIDDEN / 128), 32, 0, stream>>>
-    (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsvh, dsvh,
-     assignments, MOE_HIDDEN, experts, false);
+    launch_moe_had_rows<false, true>
+    (down_out.data_ptr(), down_out.data_ptr(), selected_ptr, order_ptr, counts_ptr, dsvh, dsvh, assignments, MOE_HIDDEN, experts, false, assignments, stream);
 
     moe_prefill_weighted_reduce_kernel
         <<<dim3(CEIL_DIVIDE(MOE_HIDDEN, 256), rows), 256, 0, stream>>>

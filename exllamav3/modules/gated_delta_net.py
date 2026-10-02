@@ -18,6 +18,7 @@ import os
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
+from .gated_delta_net_fn.conv1d import MAX_CUDA_SEQLEN as _CONV_NATIVE_MAX_SEQLEN
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
@@ -67,6 +68,15 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
     layers = [module.tp_recurrent_lookup[cache_id] for module in recurrent_modules]
     _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
 
+
+
+def _conv_input(qkv: torch.Tensor) -> torch.Tensor:
+    """(b, s, d) projection output -> (b, d, s) bf16 conv input. Decode-size chunks feed the
+    native conv kernel, which needs a contiguous (b, d, s) tensor. Longer chunks take the
+    stride-aware Triton conv, so they get a strided view of a plain dtype cast: one coalesced
+    pass instead of a strided cast plus a full transpose copy (~4 ms per layer at 2048 rows)."""
+    v = qkv.transpose(1, 2).to(torch.bfloat16)
+    return v.contiguous() if qkv.shape[1] <= _CONV_NATIVE_MAX_SEQLEN else v
 
 class GDNState:
 
@@ -1065,7 +1075,7 @@ class GatedDeltaNet(Module):
             )
         elif self.kda:
             qkv = self.qkv_proj.forward(x, params)
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            mixed_qkv = _conv_input(qkv)
 
             # Low-rank sigmoid output gate stands in for z (applied by the gated norm)
             z = self.g_b_proj.forward(self.g_a_proj.forward(x, params).to(torch.half), params) \
@@ -1094,7 +1104,7 @@ class GatedDeltaNet(Module):
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
 
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            mixed_qkv = _conv_input(qkv)
 
             beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
             g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)

@@ -202,6 +202,24 @@ if torch.version.hip:
         if not hasattr(exllamav3_ext, _name):
             setattr(exllamav3_ext, _name, getattr(_fb, _name))
 
+    # RMS norms: one-pass Triton kernels (norm_triton.py) in front of the multi-pass torch
+    # fallbacks. Each returns False for a case it does not cover, which drops to the fallback
+    # for that call. EXL3_TRITON_NORM=0 keeps the plain fallbacks.
+    if os.environ.get("EXL3_TRITON_NORM", "1") != "0":
+        try:
+            from . import norm_triton as _nt
+        except ImportError:
+            _nt = None
+        if _nt is not None:
+            def _wrap_norm(tr_fn, fb_fn):
+                def f(*args, **kwargs):
+                    if tr_fn(*args, **kwargs) is False:
+                        return fb_fn(*args, **kwargs)
+                return f
+            for _name in ('rms_norm', 'rms_norm_res_in', 'gated_rms_norm'):
+                if getattr(exllamav3_ext, _name, None) is getattr(_fb, _name):
+                    setattr(exllamav3_ext, _name, _wrap_norm(getattr(_nt, _name), getattr(_fb, _name)))
+
     # Keep the public API stable while using the fixed-K native QSA kernel only for its
     # validated gfx12 wave32 shape. Everything else retains the general PyTorch fallback.
     if hasattr(exllamav3_ext, "dsa_topk_gfx12"):

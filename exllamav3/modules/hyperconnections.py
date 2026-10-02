@@ -29,6 +29,18 @@ def _hc_mix_supported(device: torch.device) -> bool:
     return _hc_mix_support_cache[key]
 
 
+def _gr_triton_ok(device: torch.device) -> bool:
+    """Prefill GatedResidual mix through the Triton kernels in hc_triton.py: ROCm only (the
+    measured win is gfx1151; NVIDIA keeps its existing path), opt out with EXL3_GR_TRITON=0."""
+    if not torch.version.hip or device.type != "cuda" or os.environ.get("EXL3_GR_TRITON", "1") == "0":
+        return False
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
 # the embedding into the streams, each sublayer site mixes them through a HyperConnection
@@ -433,15 +445,26 @@ class GatedResidual(Module):
             post = torch.empty((R, H), dtype = torch.float, device = dev) \
                 if self.use_combine else None
             normed = torch.empty((R * H, Dh), dtype = torch.half, device = dev)
-            ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
-                         self.rms_eps, 0.0, 1.0, False, False, H)
+            # Prefill rows: one-pass Triton norm and tail (hc_triton.py). ext.rms_norm and the
+            # five-kernel torch tail both ran at ~26 GB/s here; EXL3_GR_TRITON=0 restores them
+            use_tr = _gr_triton_ok(dev)
+            if use_tr:
+                from .hc_triton import gr_norm
+                gr_norm(s3.view(R * H, Dh), self.w_h, H, self.rms_eps, normed)
+            else:
+                ext.rms_norm(s3.view(R * H, Dh), self.w_h, normed,
+                             self.rms_eps, 0.0, 1.0, False, False, H)
             dm = torch.matmul(normed.view(R, H * Dh), self.proj_h.t())     # (R, rank [+ H])
             t = F.silu(dm[:, : self.rank] / H)
             if self.use_combine:
                 post.copy_(2.0 * torch.sigmoid(dm[:, self.rank :].float() / H))
             g = torch.matmul(t, self.up_h.t())                             # (R, H * Dh)
-            mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
-                     * normed.float().view(R, H, Dh)).mean(dim = -2).half()
+            if use_tr:
+                from .hc_triton import gr_tail
+                mixed = gr_tail(g, normed, R, H, Dh)
+            else:
+                mixed = (torch.sigmoid(g.float()).view(R, H, Dh)
+                         * normed.float().view(R, H, Dh)).mean(dim = -2).half()
         return post, mixed
 
     def mix(self, streams: torch.Tensor, params: dict):

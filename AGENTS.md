@@ -13,8 +13,12 @@ untouched `sdougbrown/exllamav3` base.
   build/bench-in-separate-shells rule. Harnesses live in `tools/strix_halo/`; `rebuild.sh`
   (`FULL=1` after header edits) is the only supported way to rebuild, because the repo-root
   `exllamav3_ext*.so` shadows site-packages and a hand rebuild will benchmark stale code.
-- **Verifying a change**: PPL via `eval/ppl.py -r 20 -l 1024` must stay 4.225935 on the
-  Qwen3.8-Flash-Next 3.05 bpw pack; `tools/strix_halo/greedy_ab.py` (run KNOB=x vs KNOB=x
+- **Verifying a change**: PPL via `eval/ppl.py -r 20 -l 1024` must stay 4.230441 on the
+  Qwen3.8-Flash-Next 3.05 bpw pack with `EXL3_HIP_F32OUT_VIA_F16=0` (4.218831 at its default);
+  CYBER-FROST 3.87 bpw mixed-K reads 4.261538. The pre-Triton-norm value 4.225935 is
+  reproduced exactly with `EXL3_TRITON_NORM=0 EXL3_GR_TRITON=0` (summation order only: the
+  Triton norms score identically to the torch path against fp64, see
+  `tools/strix_halo/norm_truth.py`). `tools/strix_halo/greedy_ab.py` (run KNOB=x vs KNOB=x
   first for the noise floor) and `tie_check.py` (teacher-forced logit deltas — a summation-
   order change legitimately flips coin-flip tokens; a flip with a multi-logit gap is a bug).
   Then `bench_mtp.py -g` and `prompt_sweep.py` for the six-prompt mean. Never quote a single
