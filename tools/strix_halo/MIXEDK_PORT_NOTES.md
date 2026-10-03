@@ -153,7 +153,22 @@ band as the existing `EXL3_HIP_F32OUT_VIA_F16` knob: flat 4.225935 -> 4.230441 (
 `EXL3_TRITON_NORM=0 EXL3_GR_TRITON=0` reproduces 4.225935 exactly. Decode is unchanged
 (six-prompt: flat 46.38, mixed 39.51).
 
-Tried and reverted: decoding each MoE weight tile once across up to 64 routed rows (one trellis
+QSA sparse attention for prefill (`modules/attention_fn/qsa_tiled.py`): the per-row kernel had
+every query row gather its own ~2050 selected tokens (52 ms per layer-chunk at 8k, 15 % of
+prefill). Adjacent rows select nearly the same blocks (union over 16 rows is 1.05-1.6x one
+row's set), so one program now owns 16 rows x 4 heads, walks the union of their blocks once
+and masks per row. Same token sets; summation order only. 52 -> 13.8 ms per call (fp16 cache),
+41 -> 25 ms (q4). Prefill 637 -> 703 tok/s (8k), 619 -> 674 (32k). Against an fp32 reference
+the mean error equals the per-row kernel's (3.5e-05 both). A 12k real-text prompt decodes
+64/64 identical greedy tokens; first-step logit drift (max 1.5) is below the Triton-norm noise
+floor at that length. `-l 1024` PPL does not reach the sparse path (threshold 2048), so PPL is
+not evidence here. Single-sequence chunks of >= 64 rows only; `EXL3_QSA_TILED=0` disables.
+
+Tried and reverted: MoE prefill build flags `EXL3_HIP_A_RING`, `EXL3_HIP_PF_DEPTH=4`,
+`EXL3_HIP_PF_AFTER_STAGE` (24.9-26.4 ms vs 25.0 ms). Reconstructing active experts to fp16 for
+hipBLASLt: the reconstruct alone is 28 ms per layer vs 25 ms for the whole grouped GEMV.
+
+Also tried and reverted: decoding each MoE weight tile once across up to 64 routed rows (one trellis
 decode, four WMMA M tiles). No change. Routing all 20,480 assignments onto 40 experts (weights
 read ~once) only cut the grouped GEMV from 25.1 to 21.5 ms, so neither weight traffic nor decode
 bounds the MoE prefill GEMV.
@@ -164,6 +179,7 @@ bounds the MoE prefill GEMV.
 - `EXL3_GEMV=0` still disables all HIP GEMV, including this route.
 - `EXL3_HIP_GROUPED_MOE=0` / `EXL3_HIP_GROUPED_MOE_PREFILL=0` disable the decode / prefill
   grouped routes, K3 and mixed-K alike.
+- `EXL3_QSA_TILED=0` keeps the per-row QSA sparse prefill kernel.
 - `EXL3_TRITON_NORM=0` keeps the torch RMS-norm fallbacks; `EXL3_GR_TRITON=0` keeps the torch
   prefill GatedResidual mix.
 

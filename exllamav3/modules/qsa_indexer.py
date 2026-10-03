@@ -38,6 +38,14 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     return torch.cat((x_rope * cos + rot * sin, x_pass), dim = -1)
 
 
+
+_QSA_TILED_MIN_ROWS = 64
+
+
+def _qsa_tiled_enabled() -> bool:
+    import os
+    return os.environ.get("EXL3_QSA_TILED", "1") != "0"
+
 class QSAIndexer(Module):
 
     def __init__(
@@ -662,8 +670,6 @@ class QSAIndexer(Module):
         from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
-        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
-            .reshape(bsz * seq, -1).contiguous()
         if isinstance(layer, CacheLayer_quant):
             # Packed pages, dequantized online by the gather kernel
             qk, sk, qv, sv, kb, vb = layer.get_qkv()
@@ -672,6 +678,22 @@ class QSAIndexer(Module):
             k_arg = layer.k.view(-1, attn.num_kv_heads, attn.head_dim)
             v_arg = layer.v.view(-1, attn.num_kv_heads, attn.head_dim)
             qc, page_size = None, layer.k.shape[1]
+        # Single-sequence prefill chunk: tile-union kernel (qsa_tiled.py). Adjacent query rows
+        # select nearly the same blocks, so 16 rows share one gather of their union instead of
+        # each re-gathering ~budget tokens. Same token sets, exact per-row masking.
+        # EXL3_QSA_TILED=0 keeps the per-row kernel.
+        if bsz == 1 and seq >= _QSA_TILED_MIN_ROWS and _qsa_tiled_enabled():
+            from .attention_fn.qsa_tiled import qsa_sparse_attend_tiled
+            o = qsa_sparse_attend_tiled(
+                q.reshape(seq, attn.num_q_heads, attn.head_dim).contiguous(),
+                k_arg, v_arg, indices, attn.sm_scale,
+                block_table = block_table.int()[0].contiguous(), page_size = page_size,
+                pos0 = int(cache_seqlens_cpu[0]), cr = self.compress_ratio,
+                qc = qc, n_kv_heads = attn.num_kv_heads,
+            )
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+        bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
+            .reshape(bsz * seq, -1).contiguous()
         o = qsa_sparse_attend_rows(
             q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
             k_arg, v_arg, indices, attn.sm_scale,
