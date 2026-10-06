@@ -13,7 +13,8 @@ off when acceptance is high -- a low rate means wasted verification work.
 import argparse, os, sys, time
 import torch
 
-sys.path.insert(0, os.path.expanduser("~/exllamav3-amd"))
+# The checkout this script lives in (works from any worktree, e.g. a side-by-side ROCm build)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-m", "--model", default=os.path.expanduser("~/models/Qwen3.8-Flash-Next-EXL3"))

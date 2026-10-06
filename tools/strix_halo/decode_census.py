@@ -3,19 +3,21 @@
 import os, sys, collections
 import torch
 from torch.profiler import profile, ProfilerActivity
-sys.path.insert(0, os.path.expanduser("~/exllamav3-amd"))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
 from exllamav3.generator.sampler import GreedySampler
 
-MODEL = os.path.expanduser("~/models/Qwen3.8-Flash-Next-EXL3")
+MODEL = os.path.expanduser(os.environ.get("MODEL", "~/models/Qwen3.8-Flash-Next-EXL3"))
 NDT = int(os.environ.get("NDT", "3"))
 NTOK = int(os.environ.get("NTOK", "96"))
 config = Config.from_directory(MODEL)
 model = Model.from_config(config); tok = Tokenizer.from_config(config)
-dconfig = Config.from_directory(MODEL); dconfig.arch_override = "qwen4_exp_mtp.py"
-draft = Model.from_config(dconfig)
-cache = Cache(model, max_num_tokens=32768, max_history=NDT); model.load(progressbar=False)
-dcache = Cache(draft, max_num_tokens=32768, max_history=NDT); draft.load(progressbar=False)
+# MTP drafter = the same directory loaded as its "mtp" component (as bench_mtp.py does). The
+# old arch_override="qwen4_exp_mtp.py" route instantiated a second full model and OOMs now.
+draft = Model.from_config(config, component="mtp")
+CS = int(os.environ.get("CACHE", "4096"))
+cache = Cache(model, max_num_tokens=CS, max_history=NDT); model.load(progressbar=False)
+dcache = Cache(draft, max_num_tokens=CS, max_history=NDT); draft.load(progressbar=False)
 gen = Generator(model=model, cache=cache, tokenizer=tok, draft_model=draft, draft_cache=dcache,
                 num_draft_tokens=NDT, dynamic_draft_tokens=True, draft_confidence=0.6)
 ids = tok.encode("Explain gradient descent in two sentences:", add_bos=True)
@@ -45,8 +47,9 @@ fam = collections.defaultdict(lambda: [0, 0.0])
 def family(k):
     k = k.replace("void (anonymous namespace)::", "").replace("void at::native::", "")
     for p in ("Cijk_", "moe_prefill_grouped_gemv", "moe_prefill_had_rows", "moe_prefill_metadata",
-              "exl3_gemv", "gr_mix", "gr_dots", "gr_finalize", "had_r_128", "reconstruct",
-              "chunk_fwd", "recompute_w_u", "_causal_conv1d", "hgemm", "skinny",
+              "moe_mk", "exl3_gemv", "gr_mix", "gr_dots", "gr_finalize", "had_r_128", "reconstruct",
+              "chunk_fwd", "recompute_w_u", "_causal_conv1d", "hgemm", "skinny", "triton_",
+              "elementwise_kernel", "reduce_kernel", "softmax", "topk", "sort", "index",
               "aten::mm", "aten::copy_", "aten::mul", "hipLaunchKernel", "hipPointerGetAttribute"):
         if p in k: return p
     return k[:40]
@@ -57,8 +60,16 @@ for e in ka:
     fam[f][0] += e.count
     fam[f][1] += d
 print(f"{'family':32} {'calls':>7} {'ms':>10} {'%dev':>6}")
-for f, (n, d) in sorted(fam.items(), key=lambda kv: -kv[1][1])[:18]:
+for f, (n, d) in sorted(fam.items(), key=lambda kv: -kv[1][1])[:24]:
     print(f"{f:32} {n:7d} {d/1000:10.1f} {100*d/dev:6.1f}")
+# host side: total launch API time, a proxy for dispatch overhead
+host = collections.defaultdict(lambda: [0, 0.0])
+for e in ka:
+    if e.key.startswith("hip") or e.key.startswith("cuda"):
+        host[e.key][0] += e.count; host[e.key][1] += (getattr(e, "self_cpu_time_total", 0) or 0)
+print("HOST runtime API:")
+for k, (n, t) in sorted(host.items(), key=lambda kv: -kv[1][1])[:6]:
+    print(f"  {k:32} {n:7d} {t/1000:10.1f} ms  {t/max(n,1):6.2f} us/call")
 print("TOP kernels:")
 for e in sorted(ka, key=lambda e: -(getattr(e, "self_device_time_total", 0) or 0))[:12]:
     d = getattr(e, "self_device_time_total", 0) or 0

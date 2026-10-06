@@ -17,7 +17,7 @@ wins depends on the prompt, so it has to be judged on the distribution, never on
 import os, subprocess, sys, re, statistics, json
 from pathlib import Path
 
-REPO = Path(os.path.expanduser("~/exllamav3-amd"))
+REPO = Path(__file__).resolve().parents[2]   # the checkout this script lives in
 PROMPTS = [
     "Explain gradient descent in two sentences:",
     "Write a short technical summary of how GPUs execute matrix multiplication:",
@@ -52,8 +52,10 @@ print(f"CONFIG {cfg}  ntok={N}  label={LABEL or '-'}")
 print(f"{'tok/s':>8} {'accept':>8}  prompt")
 print("-" * 78)
 for p in PROMPTS:
+    # The interpreter running this sweep, not a hardcoded .venv: lets one tree bench any venv
+    # (e.g. the ROCm 10.1 side-by-side). The script path avoids the untracked root symlink.
     r = subprocess.run(
-        [str(REPO / ".venv/bin/python"), str(REPO / "bench_mtp.py")] + args + ["-p", p],
+        [sys.executable, str(REPO / "tools/strix_halo/bench_mtp.py")] + args + ["-p", p],
         capture_output=True, text=True, env=env, timeout=1800)
     out = r.stdout + r.stderr
     m = re.search(r"decode:\s+([0-9.]+) tok/s", out)
