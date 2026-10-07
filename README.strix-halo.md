@@ -49,6 +49,46 @@ Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch 
 | + `EXL3_HIP_STG_PAD` (LDS bank conflict fix) | **34.9 mean / 41.1 peak** |
 | + skinny fp16 GEMM for GDN b/a proj (`hgemm.cu`, replaces hipblaslt split-K) | 36.1 mean / 44.4 peak |
 | + **int8 GatedResidual mixer weights** (`gr_mix_q8`, −22 % of decode bytes) | **40.0 mean / 46.3 peak** (ndt=2) · **41.3 mean / 43.7 peak** (ndt=3 dc=0.6) |
+| (later: metadata scan, Triton norms, QSA tiling; re-baselined, ndt=3 dyn dc=0.6) | 46.48 mean / 51.0 peak |
+| + **reduced-vocabulary MTP draft head** (`EXL3_MTP_DRAFT_VOCAB=98304`, default) | **48.79 mean / 53.8 peak** · CYBER-FROST 39.3 → **41.85** |
+
+### Reduced-vocabulary MTP draft head
+
+The MTP drafter scored all 248,320 vocabulary columns every draft step: a full pass over the
+EXL3 lm_head (5 bpw, 1.9 ms per step at 1 row; 8 bpw on CYBER-FROST), about 8 % of decode
+wall time. Its only job is to propose a token the target then verifies, so it now scores two
+exact slices of the same head (same trellis tiles, Hadamard and sign vectors):
+
+- columns `[0, 98304)`: BPE merge order puts frequent tokens at low ids; this prefix covers
+  98.2 % of calibration-text tokens;
+- the special/control block from id 248044 up. The drafter proposes these often
+  (`<|im_start|>`, `</think>`, ...: ~15 % of drafts on chat-less prompts). A prefix-only first
+  attempt left them out and halved acceptance (69.5 % → 35 %).
+
+The target still verifies every drafted token, so this can only change the acceptance rate,
+never the output, up to the same near-tie behavior any draft change has under MTP:
+
+| check | result |
+|---|---|
+| sliced head vs full head, rows 1/2/4/16 (`subhead_parity.py`) | bit-identical logits |
+| greedy 2 × 512 tokens, full head vs 98304 (`greedy_ab.py`) | **identical** |
+| same at 65536 | one flip at a 0.078-logit near-tie (`divergence_margin.py`) |
+| six-prompt flat, 2 interleaved reps (`mtp_draft_ab.sh`) | 46.48 / 46.48 → **48.86 / 48.88**, acceptance 72.8 → 73.0 % |
+| six-prompt CYBER-FROST | 39.21 → 42.24 (A/B), 39.34 → 41.85 (gate run) |
+| batched b=5 ndt=2 (`batch_throughput.py`) | 92.1 → 96.1 aggregate |
+| sampled, 3 runs each | 40.6–50.9 → 44.7–49.7 (within sampling spread) |
+| PPL (does not use the drafter) | 4.218831, unchanged |
+
+65536 and 32768 are no faster than 98304 (48.63 / 48.56): below ~100k columns the slice
+stops being the cost. `EXL3_MTP_DRAFT_VOCAB=0` restores the full head.
+
+Also tried, no effect: staging the drafter's embedding row through pinned memory
+(`hipMemcpyWithStream` 148 µs/step in the sync census): 46.47 vs 46.48 tok/s. The copy
+overlaps GPU work already queued, so it was not on the critical path. Reverted.
+
+Round anatomy after this change (`round_timeline.py`, 57.1 ms/round, 2.84 tok/round): verify
+forward ~51 ms (90 %), draft loop 4.9 ms, draft prefill 1.4 ms. The verify forward alone caps
+single-stream decode at ~55 tok/s with free drafting at this acceptance.
 
 Six-prompt greedy means, 512 tokens (`prompt_sweep.py`). PPL 4.225935 unchanged through every
 row. Per-round phase split (`phase_prof.py`): trunk verify forward 85–88 %, MTP head 10–12 %,

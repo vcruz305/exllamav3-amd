@@ -24,13 +24,13 @@ from exllamav3.generator.sampler import GreedySampler
 prompts = json.loads(sys.argv[1]); n = int(sys.argv[2]); nomtp = sys.argv[3] == "1"
 config = Config.from_directory(os.path.expanduser("~/models/Qwen3.8-Flash-Next-EXL3"))
 model = Model.from_config(config); tok = Tokenizer.from_config(config)
-mh = 0 if nomtp else 2
+mh = 0 if nomtp else 3
 cache = Cache(model, max_num_tokens=4096, max_history=mh); model.load(progressbar=False)
 if nomtp:
     gen = Generator(model=model, cache=cache, tokenizer=tok)
 else:
-    draft = Model.from_config(config, component="mtp"); dcache = Cache(draft, max_num_tokens=4096, max_history=2); draft.load(progressbar=False)
-    gen = Generator(model=model, cache=cache, tokenizer=tok, draft_model=draft, draft_cache=dcache, num_draft_tokens=2, dynamic_draft_tokens=True, draft_confidence=0.4)
+    draft = Model.from_config(config, component="mtp"); dcache = Cache(draft, max_num_tokens=4096, max_history=3); draft.load(progressbar=False)
+    gen = Generator(model=model, cache=cache, tokenizer=tok, draft_model=draft, draft_cache=dcache, num_draft_tokens=3, dynamic_draft_tokens=True, draft_confidence=0.6)
 out = []
 for p in prompts:
     ids = tok.encode(p, add_bos=True)
@@ -55,6 +55,8 @@ for tag, v in (("a", VALS[0]), ("b", VALS[1])):
     res[tag] = json.loads(line[0][4:])
     print(f"{KNOB}={v}: {[len(x) for x in res[tag]]} tokens  (mtp={'off' if NOMTP else 'on'})")
 same = res["a"] == res["b"]
+if os.environ.get("DUMP"):
+    json.dump(res, open(os.environ["DUMP"], "w"))
 print("IDENTICAL" if same else "MISMATCH")
 if not same:
     for a, b in zip(res["a"], res["b"]):

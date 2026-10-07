@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 from ..util.device_copy import to_device
 import weakref
@@ -8,6 +9,7 @@ from ..model.config import Config
 from ..model.model import Model
 from ..modules import Embedding, Linear, GatedResidual
 from ..modules.module import Module
+from ..modules.quant.exl3 import LinearEXL3
 from ..modules.arch_specific.qwen4_exp_mtp import Qwen4ExpMTPInputLayer
 from ..modules.attn import prepare_for_attn
 
@@ -176,10 +178,81 @@ class Qwen4ExpMTPModel(Model):
         ll = self.attached_model().logit_layer_idx
         lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state, params)
-        logits = lm.forward(logits, params)
+        sub = self._draft_head(lm)
+        if sub is not None:
+            # Drafting scores only the vocab prefix [0, N) plus the special/control block at the
+            # top of the vocab; the target verifies every drafted token, so output is unchanged
+            # and only the acceptance rate can move
+            head, tail, tail_start = sub
+            flat = logits.view(-1, logits.shape[-1])
+            lo = head.forward(flat, params)
+            hi = tail.forward(flat, params)
+            V = self.attached_model().config.vocab_size
+            full = torch.full((flat.shape[0], V), float("-inf"), dtype = lo.dtype, device = lo.device)
+            full[:, :lo.shape[-1]] = lo
+            n_tail = min(hi.shape[-1], V - tail_start)
+            full[:, tail_start:tail_start + n_tail] = hi[:, :n_tail]
+            logits = full.view(bsz, seq, V)
+        else:
+            logits = lm.forward(logits, params)
         if params.get("export_draft_conf"):
             logits = logits[..., :self.attached_model().config.vocab_size]
             conf, ids = torch.max(logits, dim = -1)
             params["draft_conf"] = conf
             return ids
         return torch.argmax(logits, dim = -1)
+
+    def _draft_head(self, lm):
+        """
+        (head, tail, tail_start) for a reduced-vocabulary draft head, or None for the full head.
+
+        head: the EXL3 lm_head sliced to output columns [0, N), N = EXL3_MTP_DRAFT_VOCAB (default
+        98304, 0 = full head) rounded down to a multiple of 128. BPE merge order puts frequent tokens at low ids: on the
+        Flash-Next tokenizer 98,304 of 248,320 columns cover 98.2 % of calibration-text tokens.
+        tail: the same head sliced to the special/control block at the top of the vocabulary
+        (from the tokenizer's first special id, rounded down to 128, to the end). The drafter
+        proposes these often (<|im_start|>, </think>, ...: ~15 % of drafts on chat-less
+        prompts), so they must stay draftable.
+
+        Both slices are exact (same trellis tiles, Hadamard and sign vectors as the full head).
+        The trellis is tiled [k/16, n/16, 16K], so each slice is one contiguous copy made at
+        first use (65,536 columns at 5 bpw: ~105 MB).
+        """
+        n = _draft_vocab_cols()
+        cached = getattr(self, "_draft_head_cache", None)
+        if cached is not None and cached[0] is lm.inner and cached[1] == n:
+            return cached[2]
+        sub = None
+        inner = getattr(lm, "inner", None)
+        tail_start = _special_start(self.attached_model().config.vocab_size)
+        if n and isinstance(inner, LinearEXL3) and n < tail_start and not lm.lora_a_tensors \
+                and lm.softcap == 0.0 and lm.pre_scale == 1.0 and lm.post_scale == 1.0:
+            def slice_cols(a, b):
+                return LinearEXL3(
+                    None, inner.in_features, b - a,
+                    suh = inner.suh,
+                    svh = inner.svh[a:b].contiguous(),
+                    trellis = inner.trellis[:, a // 16 : b // 16, :].contiguous(),
+                    mcg = inner.mcg_tensor,
+                    mul1 = inner.mul1_tensor,
+                    bias = inner.bias[a:b].contiguous() if inner.bias is not None else None,
+                    out_dtype = inner.out_dtype,
+                    key = (inner.key or "lm_head") + f".draft{a}_{b}",
+                )
+            sub = (slice_cols(0, n), slice_cols(tail_start, inner.out_features), tail_start)
+        self._draft_head_cache = (inner, n, sub)
+        return sub
+
+
+def _special_start(vocab_size: int) -> int:
+    """First column of the special/control block, rounded down to a multiple of 128. Qwen3.x
+    tokenizers put all added tokens above the BPE vocab (Flash-Next: 248044 onward)."""
+    s = int(os.environ.get("EXL3_MTP_DRAFT_SPECIAL_START", "248044"))
+    return min((s // 128) * 128, vocab_size)
+
+
+def _draft_vocab_cols() -> int:
+    # Default 98304: token-identical greedy output to the full head and +5 % six-prompt decode on
+    # gfx1151 (README.strix-halo.md). 0 = full head.
+    n = int(os.environ.get("EXL3_MTP_DRAFT_VOCAB", "98304") or 0)
+    return (n // 128) * 128 if n > 0 else 0
