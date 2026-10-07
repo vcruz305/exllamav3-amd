@@ -51,6 +51,32 @@ Based on [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) branch 
 | + **int8 GatedResidual mixer weights** (`gr_mix_q8`, −22 % of decode bytes) | **40.0 mean / 46.3 peak** (ndt=2) · **41.3 mean / 43.7 peak** (ndt=3 dc=0.6) |
 | (later: metadata scan, Triton norms, QSA tiling; re-baselined, ndt=3 dyn dc=0.6) | 46.48 mean / 51.0 peak |
 | + **reduced-vocabulary MTP draft head** (`EXL3_MTP_DRAFT_VOCAB=98304`, default) | **48.79 mean / 53.8 peak** · CYBER-FROST 39.3 → **41.85** |
+| + **register-resident GDN recurrent state** (`gdn.cu`, bit-identical) | **49.95 mean / 55.2 peak** |
+
+### Register-resident GDN recurrent state
+
+`cuda_recurrent_gated_delta_rule_kernel_128` (36 GatedDeltaNet layers) walked each 128×128
+fp32 head state through memory twice per token: phase 1 reads it for `k·S`, phase 2 reads it
+again, updates it and writes it back. Over an R-row verify that is 2R reads + R writes of
+64 KiB per head per layer. Each thread (t, bt) owns the same 32 state rows of one column in
+both phases and every step, so the slice now stays in registers for the whole call: one load,
+then only the writes the cache needs (every per-step snapshot with history, the final state
+without). The FMAs are the same and run in the same order.
+
+| check | result |
+|---|---|
+| PPL | 4.218831 = 4.218831 |
+| greedy 2 × 256, no MTP | identical |
+| greedy 2 × 512, MTP | identical to the previous build |
+| isolated verify forward R=4 (`verify_hostdev.py`) | 52.42 → 50.92 ms |
+| isolated verify forward R=1 | 35.49 → 35.39 ms |
+| six-prompt, interleaved ×2 (`gdn_reg_gate.sh`) | 48.73 / 48.71 → **49.97 / 49.92** |
+
+The gain grows with R, so it lands almost entirely on the MTP verify forward.
+
+Draft window after the cheaper draft head (`ndt_resweep.sh`, one rep each; differences under
+~1 tok/s are drift): ndt=3 dc=0.6 48.77 / 48.75, ndt=3 dc=0.5 49.12, ndt=4 dc=0.6 49.41,
+ndt=4 dc=0.5 49.42, ndt=4 dc=0.7 48.58, ndt=5 dc=0.6 49.61.
 
 ### Reduced-vocabulary MTP draft head
 

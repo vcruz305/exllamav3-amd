@@ -717,6 +717,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     __shared__ float sh_dot1[SUBK][HEAD_DIM];
     __shared__ float sh_dot2[SUBK][HEAD_DIM];
     __shared__ float sh_g[CHANNELWISE ? HEAD_DIM : 1];
+    float st[BTS];
 
     for (int s = 0; s < seqlen; ++s)
     {
@@ -781,23 +782,28 @@ void cuda_recurrent_gated_delta_rule_kernel_128
 
         if (t < V_CHUNK_DIM)
         {
+            // Register-resident state (EXL3_GDN_REG_STATE): thread (t, bt) owns rows
+            // [bt * BTS, (bt + 1) * BTS) of column v_start + t for the whole call, in both
+            // phases and every step, so the slice is loaded once and never re-read from memory.
+            // Same FMAs in the same order as the memory round trip: bit-identical results.
+            if (s == 0)
+            {
+                const float* rs_ld = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+                #pragma unroll
+                for (int m = 0; m < BTS; ++m) st[m] = rs_ld[(size_t) m * HEAD_DIM];
+            }
             float sum = 0.0f;
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
-            float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int m = 0; m < BTS; ++m)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++, sh_g_rd++)
-                {
-                    if constexpr (CHANNELWISE)
-                        // Decay folded per k-channel: kv_mem reads the decayed state
-                        sum = sum + *sh_k_rd * *sh_g_rd * *rs_rd;
-                    else
-                        sum = sum + *sh_k_rd * *rs_rd;
-                }
+                if constexpr (CHANNELWISE)
+                    // Decay folded per k-channel: kv_mem reads the decayed state
+                    sum = sum + sh_k_rd[m] * sh_g_rd[m] * st[m];
+                else
+                    sum = sum + sh_k_rd[m] * st[m];
             }
             sh_dot1[bt][t] = sum;
         }
@@ -816,20 +822,19 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
             float* sh_q_rd = sh_q + bt * BTS;
-            float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
             float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
+            // History mode keeps every per-step snapshot (rewind targets); otherwise only the
+            // final state is stored, since intermediate in-place writes were overwritten anyway
+            const bool store = save_history || (s == seqlen - 1);
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int m = 0; m < BTS; ++m)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
-                {
-                    float state = *rs_r;
-                    state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
-                    *rs_w = state;
-                    v_out = v_out + *sh_q_rd * state;
-                }
+                float state = st[m];
+                state = state * (CHANNELWISE ? sh_g_rd[m] : g_h) + sh_k_rd[m] * v * beta_h;
+                st[m] = state;
+                if (store) rs_w[(size_t) m * HEAD_DIM] = state;
+                v_out = v_out + sh_q_rd[m] * state;
             }
             sh_dot2[bt][t] = v_out;
         }
